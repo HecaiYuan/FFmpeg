@@ -130,17 +130,25 @@ typedef struct AudioParams {
     int freq;
     AVChannelLayout ch_layout;
     enum AVSampleFormat fmt;
-    int frame_size;
-    int bytes_per_sec;
+    /* 总样本数 = frame_size × 声道数 用于计算音频帧时长：frame_size / freq 秒 */
+    int frame_size; // 每帧的样本数（每个声道），即单个音频帧中每个声道包含的样本数量
+    int bytes_per_sec; // 计算比特率和缓冲区大小 bytes_per_sec = freq × 每样本字节数 × 声道数
 } AudioParams;
 
 typedef struct Clock {
     double pts;           /* clock base */
+    /*// 时钟基准与最后一次更新时间之间的差值（用于补偿系统时间漂移）
+    pts_drift = pts - system_time_at_last_update 将系统时间差转换为流时间差*/
     double pts_drift;     /* clock base minus time at which we updated the clock */
+    /*// 最后一次更新时钟的系统时间（单位通常为秒）*/
     double last_updated;
     double speed;
+    // 当前时钟关联的数据包序列号
     int serial;           /* clock is based on a packet with this serial */
+    //  序列与同步检测
     int paused;
+    // 指向当前队列序列号的指针（用于检测时钟是否过时）
+    // 序列号在 seek 或重置队列时递增，旧序列号的时钟将被视为过时。
     int *queue_serial;    /* pointer to the current packet queue serial, used for obsolete clock detection */
 } Clock;
 
@@ -159,7 +167,7 @@ typedef struct Frame {
     int width;
     int height;
     int format;
-    AVRational sar;
+    AVRational sar; // 样本宽高比
     int uploaded;
     int flip_v;
 } Frame;
@@ -170,7 +178,7 @@ typedef struct FrameQueue {
     int windex;
     int size;
     int max_size;
-    int keep_last;
+    int keep_last; // shifou保留最后一帧 注意
     int rindex_shown;
     SDL_mutex *mutex;
     SDL_cond *cond;
@@ -189,7 +197,7 @@ typedef struct Decoder {
     AVCodecContext *avctx;
     int pkt_serial;
     int finished;
-    int packet_pending;
+    int packet_pending; // 表示是否有未处理的数据包
     SDL_cond *empty_queue_cond;
     int64_t start_pts;
     AVRational start_pts_tb;
@@ -210,7 +218,7 @@ typedef struct VideoState {
     int seek_flags;
     int64_t seek_pos;
     int64_t seek_rel;
-    int read_pause_return;
+    int read_pause_return; // // 是否请求附带图片（如MP3或AAC文件的专辑封面等）
     AVFormatContext *ic;
     int realtime;
 
@@ -241,18 +249,18 @@ typedef struct VideoState {
     int audio_hw_buf_size;
     uint8_t *audio_buf;
     uint8_t *audio_buf1;
-    unsigned int audio_buf_size; /* in bytes */
-    unsigned int audio_buf1_size;
-    int audio_buf_index; /* in bytes */
-    int audio_write_buf_size;
+    unsigned int audio_buf_size; /* in bytes */ // 音频缓冲区
+    unsigned int audio_buf1_size;  // // 重采样音频缓冲区
+    int audio_buf_index; /* in bytes */ // 音频缓冲区大小
+    int audio_write_buf_size; // 重采样音频缓冲区大小
     int audio_volume;
     int muted;
     struct AudioParams audio_src;
     struct AudioParams audio_filter_src;
     struct AudioParams audio_tgt;
     struct SwrContext *swr_ctx;
-    int frame_drops_early;
-    int frame_drops_late;
+    int frame_drops_early; // // 解码器队列中由于同步问题而提前丢弃的帧
+    int frame_drops_late; // 由于播放延迟而丢弃的帧
 
     enum ShowMode {
         SHOW_MODE_NONE = -1, SHOW_MODE_VIDEO = 0, SHOW_MODE_WAVES, SHOW_MODE_RDFT, SHOW_MODE_NB
@@ -275,13 +283,13 @@ typedef struct VideoState {
     AVStream *subtitle_st;
     PacketQueue subtitleq;
 
-    double frame_timer;
-    double frame_last_returned_time;
-    double frame_last_filter_delay;
+    double frame_timer; // 帧定时器
+    double frame_last_returned_time; // 上一帧的显示时间戳
+    double frame_last_filter_delay; // 上一帧的滤镜延迟
     int video_stream;
     AVStream *video_st;
     PacketQueue videoq;
-    double max_frame_duration;      // maximum duration of a frame - above this, we consider the jump a timestamp discontinuity
+    double max_frame_duration;      // maximum duration of a frame - above this, we consider the jump a timestamp discontinuity // 最大帧持续时间
     struct SwsContext *sub_convert_ctx;
     int eof;
 
@@ -310,17 +318,17 @@ static int default_height = 480;
 static int screen_width  = 0;
 static int screen_height = 0;
 static int screen_left = SDL_WINDOWPOS_CENTERED;
-static int screen_top = SDL_WINDOWPOS_CENTERED;
+static int screen_top = SDL_WINDOWPOS_CENTERED; // 让窗口自动处于屏幕的中心位置
 static int audio_disable;
 static int video_disable;
 static int subtitle_disable;
 static const char* wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
-static int seek_by_bytes = -1;
-static float seek_interval = 10;
+static int seek_by_bytes = -1; // 表示是否按字节进行跳转
+static float seek_interval = 10; // 默认跳转间隔 10s
 static int display_disable;
-static int borderless;
-static int alwaysontop;
-static int startup_volume = 100;
+static int borderless;  // 标志位，用于表示是否创建无边框窗口
+static int alwaysontop; // 表示播放器窗口是否始终置顶
+static int startup_volume = 100;  // ，代表播放器启动时的音量大小，取值范围通常是 0 到 100
 static int show_status = -1;
 static int av_sync_type = AV_SYNC_AUDIO_MASTER;
 static int64_t start_time = AV_NOPTS_VALUE;
@@ -340,7 +348,7 @@ static const char *audio_codec_name;
 static const char *subtitle_codec_name;
 static const char *video_codec_name;
 double rdftspeed = 0.02;
-static int64_t cursor_last_shown;
+static int64_t cursor_last_shown; // 记录鼠标光标最后一次显示的时间
 static int cursor_hidden = 0;
 static const char **vfilters_list = NULL;
 static int nb_vfilters = 0;
@@ -365,6 +373,7 @@ static SDL_AudioDeviceID audio_dev;
 
 static VkRenderer *vk_renderer;
 
+// 建立 FFmpeg 像素格式（AVPixelFormat）和 SDL 像素格式之间的映射关系
 static const struct TextureFormatEntry {
     enum AVPixelFormat format;
     int texture_fmt;
@@ -390,19 +399,22 @@ static const struct TextureFormatEntry {
     { AV_PIX_FMT_UYVY422,        SDL_PIXELFORMAT_UYVY },
 };
 
+// opt_add_vfilter 函数的主要功能是处理命令行选项，将用户指定的视频过滤器添加到 vfilters_list 数组中
 static int opt_add_vfilter(void *optctx, const char *opt, const char *arg)
 {
+    // 宏，用于动态扩展数组的大小 重新分配内存
     int ret = GROW_ARRAY(vfilters_list, nb_vfilters);
     if (ret < 0)
         return ret;
-
+    // 复制一个字符串到新分配的内存中
     vfilters_list[nb_vfilters - 1] = av_strdup(arg);
     if (!vfilters_list[nb_vfilters - 1])
         return AVERROR(ENOMEM);
 
     return 0;
 }
-
+// 通过区分单声道和多声道的情况，采用不同的比较逻辑来判断两个音频格式是否相同
+// 返回0 则表示两个音频是一样的
 static inline
 int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count1,
                    enum AVSampleFormat fmt2, int64_t channel_count2)
@@ -413,7 +425,7 @@ int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count1,
     else
         return channel_count1 != channel_count2 || fmt1 != fmt2;
 }
-
+// 将pkt放入到队列中
 static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
 {
     MyAVPacketList pkt1;
@@ -425,18 +437,21 @@ static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
 
     pkt1.pkt = pkt;
     pkt1.serial = q->serial;
-
+    // int av_fifo_write(AVFifoBuffer *fifo, const void *src, int size);
+    // 环形缓冲区（FIFO）
     ret = av_fifo_write(q->pkt_list, &pkt1, 1);
     if (ret < 0)
         return ret;
     q->nb_packets++;
-    q->size += pkt1.pkt->size + sizeof(pkt1);
-    q->duration += pkt1.pkt->duration;
+    q->size += pkt1.pkt->size + sizeof(pkt1); // 总大小
+    q->duration += pkt1.pkt->duration;  // 总时长
     /* XXX: should duplicate packet data in DV case */
     SDL_CondSignal(q->cond);
     return 0;
 }
 
+// 一个 AVPacket 数据包安全地放入 PacketQueue 队列中，使用零拷贝技术优化性能，
+// 并在多线程环境下保证线程安全
 static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
 {
     AVPacket *pkt1;
@@ -447,7 +462,7 @@ static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
         av_packet_unref(pkt);
         return -1;
     }
-    av_packet_move_ref(pkt1, pkt);
+    av_packet_move_ref(pkt1, pkt); // 零拷贝优化 转移引用计数，避免数据拷贝，适用于高频数据流场 
 
     SDL_LockMutex(q->mutex);
     ret = packet_queue_put_private(q, pkt1);
@@ -459,6 +474,13 @@ static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
     return ret;
 }
 
+/*
+向指定流（如音频、视频、字幕）的 PacketQueue 中放入一个空数据包（Null Packet）‌，
+主要用于触发解码器处理流的终止或刷新状态
+空包的作用：空包（AVPacket 类型）的 data 和 size 字段通常为空，
+用于通知解码器当前流已结束或需要立即刷新缓存帧（如 FLUSH 操作)或则拖动进度或切换流时，
+需清空当前队列并发送空包，强制解码器重置状态
+*/
 static int packet_queue_put_nullpacket(PacketQueue *q, AVPacket *pkt, int stream_index)
 {
     pkt->stream_index = stream_index;
@@ -466,9 +488,11 @@ static int packet_queue_put_nullpacket(PacketQueue *q, AVPacket *pkt, int stream
 }
 
 /* packet queue handling */
+// 初始化线程安全的数据包队列结构 PacketQueue
 static int packet_queue_init(PacketQueue *q)
 {
     memset(q, 0, sizeof(PacketQueue));
+    // 创建动态增长的 FIFO 队列，用于存储 MyAVPacketList 类型的数据包节点
     q->pkt_list = av_fifo_alloc2(1, sizeof(MyAVPacketList), AV_FIFO_FLAG_AUTO_GROW);
     if (!q->pkt_list)
         return AVERROR(ENOMEM);
@@ -486,6 +510,7 @@ static int packet_queue_init(PacketQueue *q)
     return 0;
 }
 
+// 清空队列，在seek时
 static void packet_queue_flush(PacketQueue *q)
 {
     MyAVPacketList pkt1;
@@ -496,29 +521,35 @@ static void packet_queue_flush(PacketQueue *q)
     q->nb_packets = 0;
     q->size = 0;
     q->duration = 0;
-    q->serial++;
+    q->serial++; // 标识队列的序列号更新，用于区分清空前后的数据包
     SDL_UnlockMutex(q->mutex);
 }
 
 static void packet_queue_destroy(PacketQueue *q)
 {
-    packet_queue_flush(q);
-    av_fifo_freep2(&q->pkt_list);
+    packet_queue_flush(q); // 先清除数据再进行释放内存
+    av_fifo_freep2(&q->pkt_list); // 销毁 AVFifoBuffer 结构体，释放底层内存
     SDL_DestroyMutex(q->mutex);
     SDL_DestroyCond(q->cond);
 }
 
+// 强制终止 PacketQueue 队列
+// 播放终止,seek时先中止再清空
 static void packet_queue_abort(PacketQueue *q)
 {
     SDL_LockMutex(q->mutex);
 
-    q->abort_request = 1;
+    q->abort_request = 1; // 终止标志
 
     SDL_CondSignal(q->cond);
 
     SDL_UnlockMutex(q->mutex);
 }
 
+/*
+播放初始化: 重置abort_request，递增serial,激活队列并标记数据流起始点
+Seek后恢复: 清空队列，确保数据流与旧数据隔离
+*/
 static void packet_queue_start(PacketQueue *q)
 {
     SDL_LockMutex(q->mutex);
@@ -528,6 +559,7 @@ static void packet_queue_start(PacketQueue *q)
 }
 
 /* return < 0 if aborted, 0 if no packet and > 0 if packet.  */
+// 非阻塞式获取packet
 static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *serial)
 {
     MyAVPacketList pkt1;
@@ -567,43 +599,72 @@ static int decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue, S
     d->pkt = av_packet_alloc();
     if (!d->pkt)
         return AVERROR(ENOMEM);
-    d->avctx = avctx;
+    d->avctx = avctx; // 解码器上下文
     d->queue = queue;
-    d->empty_queue_cond = empty_queue_cond;
+    d->empty_queue_cond = empty_queue_cond; // 队列空条件变量
     d->start_pts = AV_NOPTS_VALUE;
     d->pkt_serial = -1;
     return 0;
 }
 
+// 从数据包队列中获取数据并进行解码
+/*
+解决B帧导致的PTS/DTS不一致问题,统一不同媒体类型(音/视频)的时间基准,补偿解码器内部缓冲引入的延迟
+
+启发式估算时间戳
+通过分析帧顺序、解码延迟等上下文信息动态生成, 当原始PTS无效时自动启用（如AV_NOPTS_VALUE情况
+适用于B帧导致的时间戳跳变修正
+
+解码时间戳(DTS)
+直接从压缩流数据包中提取
+严格反映解码器处理帧的顺序
+对不含B帧的流与PTS值相同
+
+特性	   启发式估算时间戳	     解码时间戳(DTS)
+可靠性	   可能包含误差但保证连续性  精确但可能不匹配显示顺序
+B帧处理	   自动修正显示时序	     需配合PTS使用
+容错性	   支持损坏流媒体	     依赖原始数据完整性
+计算开销   需要运行时分析	     直接读取无额外计算
+*/
 static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
-    int ret = AVERROR(EAGAIN);
+    int ret = AVERROR(EAGAIN); // 初始化返回值为EAGAIN
 
     for (;;) {
         if (d->queue->serial == d->pkt_serial) {
             do {
+                // 检查中止请求
                 if (d->queue->abort_request)
                     return -1;
 
                 switch (d->avctx->codec_type) {
                     case AVMEDIA_TYPE_VIDEO:
+                        // 从已初始化的解码器(AVCodecContext)中获取解码后的帧数据(AVFrame)
                         ret = avcodec_receive_frame(d->avctx, frame);
                         if (ret >= 0) {
+                            // 时间戳处理 解码后的帧需要转换为播放时间基
                             if (decoder_reorder_pts == -1) {
-                                frame->pts = frame->best_effort_timestamp;
+                                frame->pts = frame->best_effort_timestamp; // 启发式估算
                             } else if (!decoder_reorder_pts) {
-                                frame->pts = frame->pkt_dts;
+                                frame->pts = frame->pkt_dts; // // 使用解码时间戳
                             }
                         }
                         break;
                     case AVMEDIA_TYPE_AUDIO:
                         ret = avcodec_receive_frame(d->avctx, frame);
                         if (ret >= 0) {
-                            AVRational tb = (AVRational){1, frame->sample_rate};
+                            // // 时间戳转换 解码后的帧需要转换为播放时间基
+                            AVRational tb = (AVRational){1, frame->sample_rate}; // 音频帧的采样率
                             if (frame->pts != AV_NOPTS_VALUE)
+                                // 完成音频帧时间基转换和连续时间戳生成
+                                // av_rescale_q(a,b,c)实现公式：a * b / c，完成时间单位的等比缩放
                                 frame->pts = av_rescale_q(frame->pts, d->avctx->pkt_timebase, tb);
+                            // 当帧无有效PTS时（如原始流未包含或解码错误），使用解码器缓存的预测值
                             else if (d->next_pts != AV_NOPTS_VALUE)
                                 frame->pts = av_rescale_q(d->next_pts, d->next_pts_tb, tb);
+                            // 更新下一帧的预期pts
                             if (frame->pts != AV_NOPTS_VALUE) {
+                            // 而音频帧的PTS严格遵循采样点线性增长，因此可直接相加
+                            // 直接相加结果的单位是采样点数量
                                 d->next_pts = frame->pts + frame->nb_samples;
                                 d->next_pts_tb = tb;
                             }
@@ -611,8 +672,8 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                         break;
                 }
                 if (ret == AVERROR_EOF) {
-                    d->finished = d->pkt_serial;
-                    avcodec_flush_buffers(d->avctx);
+                    d->finished = d->pkt_serial; // 标记流结束状态
+                    avcodec_flush_buffers(d->avctx); // 清空解码器内部缓存
                     return 0;
                 }
                 if (ret >= 0)
@@ -620,15 +681,26 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
             } while (ret != AVERROR(EAGAIN));
         }
 
+        // 获取输入数据包
+        // 数据包获取与序列号同步逻辑，主要用于解码线程从队列获取压缩数据包时的状态管理
+        /*
+整体流程总结
+队列状态检测 → 空队列时唤醒生产者13
+数据包获取 → 处理pending或从队列拉取新包2
+序列号校验 → 变化时清空解码器并重置状态23
+有效性过滤 → 仅处理序列号匹配的包，其余丢弃3
+*/
         do {
-            if (d->queue->nb_packets == 0)
+            if (d->queue->nb_packets == 0) // 如果队列是空的 通知县城进行补充
                 SDL_CondSignal(d->empty_queue_cond);
+            // 处理未处理完的数据包，通常是解码失败
             if (d->packet_pending) {
                 d->packet_pending = 0;
             } else {
                 int old_serial = d->pkt_serial;
                 if (packet_queue_get(d->queue, d->pkt, 1, &d->pkt_serial) < 0)
                     return -1;
+                // 序列号变化处理
                 if (old_serial != d->pkt_serial) {
                     avcodec_flush_buffers(d->avctx);
                     d->finished = 0;
@@ -641,6 +713,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
             av_packet_unref(d->pkt);
         } while (1);
 
+        // 字幕解码
         if (d->avctx->codec_type == AVMEDIA_TYPE_SUBTITLE) {
             int got_frame = 0;
             ret = avcodec_decode_subtitle2(d->avctx, sub, &got_frame, d->pkt);
@@ -656,14 +729,14 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
         } else {
             if (d->pkt->buf && !d->pkt->opaque_ref) {
                 FrameData *fd;
-
+                // 分配帧数据缓冲区
                 d->pkt->opaque_ref = av_buffer_allocz(sizeof(*fd));
                 if (!d->pkt->opaque_ref)
                     return AVERROR(ENOMEM);
                 fd = (FrameData*)d->pkt->opaque_ref->data;
                 fd->pkt_pos = d->pkt->pos;
             }
-
+            // 发送数据包到解码器
             if (avcodec_send_packet(d->avctx, d->pkt) == AVERROR(EAGAIN)) {
                 av_log(d->avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
                 d->packet_pending = 1;
@@ -674,17 +747,21 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
     }
 }
 
+// 销毁解码器上下文
 static void decoder_destroy(Decoder *d) {
-    av_packet_free(&d->pkt);
-    avcodec_free_context(&d->avctx);
+    av_packet_free(&d->pkt);  // 释放AVPacket内存
+    avcodec_free_context(&d->avctx);  // 释放解码器上下文
 }
 
+// 清理帧队列元素
 static void frame_queue_unref_item(Frame *vp)
 {
     av_frame_unref(vp->frame);
     avsubtitle_free(&vp->sub);
 }
 
+// 帧队列(FrameQueue)的初始化逻辑，主要用于音视频同步和帧缓存管理
+// 设置缓存帧的数量以及是否保留最后一帧
 static int frame_queue_init(FrameQueue *f, PacketQueue *pktq, int max_size, int keep_last)
 {
     int i;
@@ -698,19 +775,32 @@ static int frame_queue_init(FrameQueue *f, PacketQueue *pktq, int max_size, int 
         return AVERROR(ENOMEM);
     }
     f->pktq = pktq;
-    f->max_size = FFMIN(max_size, FRAME_QUEUE_SIZE);
-    f->keep_last = !!keep_last;
+    f->max_size = FFMIN(max_size, FRAME_QUEUE_SIZE); // 限制队列的最大帧缓存数量
+    f->keep_last = !!keep_last; // 若keep_last=1，保留最后一帧避免黑屏
     for (i = 0; i < f->max_size; i++)
-        if (!(f->queue[i].frame = av_frame_alloc()))
+        if (!(f->queue[i].frame = av_frame_alloc())) // 初始化
             return AVERROR(ENOMEM);
     return 0;
 }
 
+/*
+销毁FrameQueue结构体及其所有关联资源，包括：
+
+释放队列中所有AVFrame对象12
+销毁线程同步原语（互斥锁和条件变量）
+
+1. 代码可维护性优化
+统一访问接口：frame_queue_unref_item是专门处理Frame类型资源的函数，通过指针参数传递队列元素，保持与队列其他操作（如push/pop）一致的访问方式13
+隔离实现细节：避免在销毁函数中直接操作f->queue[i]的内部字段，降低队列数据结构变更带来的影响36
+2. 线程安全兼容性
+指针传递的原子性：获取数组元素地址的操作是原子性的，而直接操作数组元素可能涉及多步内存访问（如计算偏移量），在未加锁环境下存在风险15
+与初始化对称：frame_queue_init中同样通过指针初始化队列元素，保持生命周期管理的一致性36
+*/
 static void frame_queue_destroy(FrameQueue *f)
 {
     int i;
     for (i = 0; i < f->max_size; i++) {
-        Frame *vp = &f->queue[i];
+        Frame *vp = &f->queue[i];  // 可能误操作未初始化的元素
         frame_queue_unref_item(vp);
         av_frame_free(&vp->frame);
     }
@@ -718,6 +808,15 @@ static void frame_queue_destroy(FrameQueue *f)
     SDL_DestroyCond(f->cond);
 }
 
+// 通过条件变量（SDL_CondSignal）通知等待线程
+// 发送信号，唤醒 一个 正在等待该条件变量的线程（如果有）。
+/*
+避免竞态条件：如果 SDL_CondSignal 调用时没有锁保护，可能会导致：
+
+消费者线程在检查条件（如 queue->size > 0）和 SDL_CondWait 之间错过信号（lost wakeup problem）。
+生产者线程可能在消费者线程进入等待之前发送信号，导致消费者线程永远阻塞。
+确保原子性：SDL_CondSignal 必须与互斥锁配合使用，保证信号发送时，消费者线程的等待逻辑是同步的。
+*/
 static void frame_queue_signal(FrameQueue *f)
 {
     SDL_LockMutex(f->mutex);
@@ -734,7 +833,8 @@ static Frame *frame_queue_peek_next(FrameQueue *f)
 {
     return &f->queue[(f->rindex + f->rindex_shown + 1) % f->max_size];
 }
-
+//f->rindex_shown: 当前显示偏移量（通常 0 或 1）
+// 获取最新的可用帧
 static Frame *frame_queue_peek_last(FrameQueue *f)
 {
     return &f->queue[f->rindex];
@@ -750,17 +850,18 @@ static Frame *frame_queue_peek_writable(FrameQueue *f)
     }
     SDL_UnlockMutex(f->mutex);
 
-    if (f->pktq->abort_request)
+    if (f->pktq->abort_request) // 它的修改都是在互斥锁之下的
         return NULL;
 
     return &f->queue[f->windex];
 }
 
+//  ‌多线程环境下帧队列的可读帧获取接口‌，其核心作用是为消费者线程提供安全访问帧队列的机制
 static Frame *frame_queue_peek_readable(FrameQueue *f)
 {
     /* wait until we have a readable a new frame */
     SDL_LockMutex(f->mutex);
-    while (f->size - f->rindex_shown <= 0 &&
+    while (f->size - f->rindex_shown <= 0 &&  // 检查是否有新的可读帧
            !f->pktq->abort_request) {
         SDL_CondWait(f->cond, f->mutex);
     }
