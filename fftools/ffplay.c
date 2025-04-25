@@ -850,17 +850,18 @@ static Frame *frame_queue_peek_writable(FrameQueue *f)
     }
     SDL_UnlockMutex(f->mutex);
 
-    if (f->pktq->abort_request)
+    if (f->pktq->abort_request) // 它的修改都是在互斥锁之下的
         return NULL;
 
     return &f->queue[f->windex];
 }
 
+//  ‌多线程环境下帧队列的可读帧获取接口‌，其核心作用是为消费者线程提供安全访问帧队列的机制
 static Frame *frame_queue_peek_readable(FrameQueue *f)
 {
     /* wait until we have a readable a new frame */
     SDL_LockMutex(f->mutex);
-    while (f->size - f->rindex_shown <= 0 &&
+    while (f->size - f->rindex_shown <= 0 &&  // 检查是否有新的可读帧
            !f->pktq->abort_request) {
         SDL_CondWait(f->cond, f->mutex);
     }
