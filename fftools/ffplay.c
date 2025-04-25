@@ -856,7 +856,7 @@ static Frame *frame_queue_peek_writable(FrameQueue *f)
     return &f->queue[f->windex];
 }
 
-//  ‌多线程环境下帧队列的可读帧获取接口‌，其核心作用是为消费者线程提供安全访问帧队列的机制
+//  多线程环境下帧队列的可读帧获取接口，其核心作用是为消费者线程提供安全访问帧队列的机制
 static Frame *frame_queue_peek_readable(FrameQueue *f)
 {
     /* wait until we have a readable a new frame */
@@ -873,6 +873,7 @@ static Frame *frame_queue_peek_readable(FrameQueue *f)
     return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
 }
 
+// 向环形队列写入新帧
 static void frame_queue_push(FrameQueue *f)
 {
     if (++f->windex == f->max_size)
@@ -883,12 +884,16 @@ static void frame_queue_push(FrameQueue *f)
     SDL_UnlockMutex(f->mutex);
 }
 
+// 在frame使用完后，释放frame且移动rindex
 static void frame_queue_next(FrameQueue *f)
 {
+    // 首次读取且需保留最后一帧
     if (f->keep_last && !f->rindex_shown) {
-        f->rindex_shown = 1;
+        f->rindex_shown = 1; // 标记为已显示 但不移动rindex
         return;
     }
+    // 释放单个帧资源。
+    // 减少引用计数，若计数为 0 则释放 ，重置元数据pts等，清空serial等辅助信息
     frame_queue_unref_item(&f->queue[f->rindex]);
     if (++f->rindex == f->max_size)
         f->rindex = 0;
@@ -899,12 +904,14 @@ static void frame_queue_next(FrameQueue *f)
 }
 
 /* return the number of undisplayed frames in the queue */
+// 计算未显示帧数量
 static int frame_queue_nb_remaining(FrameQueue *f)
 {
     return f->size - f->rindex_shown;
 }
 
 /* return last shown position */
+// 返回的是当前帧在输入文件中的字节偏移量
 static int64_t frame_queue_last_pos(FrameQueue *f)
 {
     Frame *fp = &f->queue[f->rindex];
