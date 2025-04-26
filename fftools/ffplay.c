@@ -511,13 +511,17 @@ static int packet_queue_init(PacketQueue *q)
 }
 
 // 清空队列，在seek时
+// 如果 直接释放 1. 引发内存泄漏或引用计数错误
+//  队列底层数据结构限制‌，AVFifo 特性‌：PacketQueue 使用 AVFifo 作为底层容器（基于循环数组实现），
+// 其存储方式为二进制数据块而非指针数组4。直接释放整个 AVFifo 缓冲区会导致内存泄漏，因 AVPacket 对象需单独释放4。
+‌// 元素独立性‌：队列中的每个 MyAVPacketList 元素均通过 av_fifo_write 写入，需通过 av_fifo_read 逐个取出以触发正确的内存释放逻辑。
 static void packet_queue_flush(PacketQueue *q)
 {
     MyAVPacketList pkt1;
 
     SDL_LockMutex(q->mutex);
-    while (av_fifo_read(q->pkt_list, &pkt1, 1) >= 0)
-        av_packet_free(&pkt1.pkt);
+    while (av_fifo_read(q->pkt_list, &pkt1, 1) >= 0) // 逐项读取元素
+        av_packet_free(&pkt1.pkt);  // 逐项释放
     q->nb_packets = 0;
     q->size = 0;
     q->duration = 0;
@@ -535,6 +539,7 @@ static void packet_queue_destroy(PacketQueue *q)
 
 // 强制终止 PacketQueue 队列
 // 播放终止,seek时先中止再清空
+// 唤醒因等待数据而阻塞的线程（例如 packet_queue_get 中等待队列非空的线程），使其检测终止标志并退出循环
 static void packet_queue_abort(PacketQueue *q)
 {
     SDL_LockMutex(q->mutex);
@@ -820,7 +825,7 @@ static void frame_queue_destroy(FrameQueue *f)
 static void frame_queue_signal(FrameQueue *f)
 {
     SDL_LockMutex(f->mutex);
-    SDL_CondSignal(f->cond);
+    SDL_CondSignal(f->cond); // 与与 SDL_CondWait 配对使用 发送信号
     SDL_UnlockMutex(f->mutex);
 }
 
@@ -923,10 +928,10 @@ static int64_t frame_queue_last_pos(FrameQueue *f)
 
 static void decoder_abort(Decoder *d, FrameQueue *fq)
 {
-    packet_queue_abort(d->queue);
-    frame_queue_signal(fq);
-    SDL_WaitThread(d->decoder_tid, NULL);
-    d->decoder_tid = NULL;
+    packet_queue_abort(d->queue); // 设置终止信号 唤醒等待中的帧队列
+    frame_queue_signal(fq);  // 唤醒线程 唤醒等待中的包队列
+    SDL_WaitThread(d->decoder_tid, NULL);  // 阻塞当前线程，等待指定目标线程执行完毕，然后释放相关内存
+    d->decoder_tid = NULL;  // 避免悬空指针与重复操作风险
     packet_queue_flush(d->queue);
 }
 
@@ -937,24 +942,29 @@ static inline void fill_rectangle(int x, int y, int w, int h)
     rect.y = y;
     rect.w = w;
     rect.h = h;
-    if (w && h)
-        SDL_RenderFillRect(renderer, &rect);
+    if (w && h) // w和h 非0
+        SDL_RenderFillRect(renderer, &rect); // 填充矩形区域
 }
 
+// 动态调整或创建 SDL 纹理的核心逻辑
 static int realloc_texture(SDL_Texture **texture, Uint32 new_format, int new_width, int new_height, SDL_BlendMode blendmode, int init_texture)
 {
     Uint32 format;
     int access, w, h;
+    // 若纹理不存在、查询失败或尺寸/格式不匹配，则触发重建逻辑
     if (!*texture || SDL_QueryTexture(*texture, &format, &access, &w, &h) < 0 || new_width != w || new_height != h || new_format != format) {
         void *pixels;
         int pitch;
         if (*texture)
             SDL_DestroyTexture(*texture);
+            // SDL_TEXTUREACCESS_STREAMING 允许 CPU 频繁写入纹理数据
         if (!(*texture = SDL_CreateTexture(renderer, new_format, SDL_TEXTUREACCESS_STREAMING, new_width, new_height)))
             return -1;
+        // 控制纹理与背景的混合效果（如透明度叠加）
         if (SDL_SetTextureBlendMode(*texture, blendmode) < 0)
             return -1;
-        if (init_texture) {
+        if (init_texture) { // 初始化纹理数据
+            // 防止未初始化内存导致渲染异常（如残留图像），在分辨率切换时，纹理数据有可能造成污染，残留之前的数据，有的区域没有覆盖数据
             if (SDL_LockTexture(*texture, NULL, &pixels, &pitch) < 0)
                 return -1;
             memset(pixels, 0, pitch * new_height);
@@ -965,43 +975,52 @@ static int realloc_texture(SDL_Texture **texture, Uint32 new_format, int new_wid
     return 0;
 }
 
+// 根据视频的 ‌样本宽高比（SAR）‌ 和图像尺寸，结合屏幕参数，计算视频在屏幕上居中显示时的 ‌位置‌ 和 ‌缩放尺寸‌，并确保宽高为偶数（兼容 YUV 格式）
 static void calculate_display_rect(SDL_Rect *rect,
                                    int scr_xleft, int scr_ytop, int scr_width, int scr_height,
                                    int pic_width, int pic_height, AVRational pic_sar)
 {
     AVRational aspect_ratio = pic_sar;
+    // sar 样本宽高比，像素宽高比
     int64_t width, height, x, y;
-
+    // 处理无效的 SAR 若sar是 0：1，则设置为1：1(方形)
     if (av_cmp_q(aspect_ratio, av_make_q(0, 1)) <= 0)
         aspect_ratio = av_make_q(1, 1);
 
+    // 显示宽高比（DAR） = SAR × (图像宽度 / 图像高度)
     aspect_ratio = av_mul_q(aspect_ratio, av_make_q(pic_width, pic_height));
 
     /* XXX: we suppose the screen has a 1.0 pixel ratio */
     height = scr_height;
+    // & ~1: 确保宽度为偶数（兼容 YUV 格式要求） YUV420 等格式要求宽高为偶数，& ~1 确保末位为 0
     width = av_rescale(height, aspect_ratio.num, aspect_ratio.den) & ~1;
-    if (width > scr_width) {
+    if (width > scr_width) { // 若计算的宽度超过屏幕宽度，则以 scr_width 为基准重新计算高度。
         width = scr_width;
         height = av_rescale(width, aspect_ratio.den, aspect_ratio.num) & ~1;
     }
+    // 居中坐标计算
     x = (scr_width - width) / 2;
     y = (scr_height - height) / 2;
+    // 输出显示矩形参数
     rect->x = scr_xleft + x;
     rect->y = scr_ytop  + y;
     rect->w = FFMAX((int)width,  1);
     rect->h = FFMAX((int)height, 1);
 }
 
+// 该函数用于将 ‌FFmpeg 像素格式‌（AV_PIX_FMT）转换为 ‌SDL 纹理像素格式‌（SDL_PIXELFORMAT），并根据格式特性设置 ‌混合模式
+// FFmpeg 与 SDL 渲染管线衔接的关键环节‌
 static void get_sdl_pix_fmt_and_blendmode(int format, Uint32 *sdl_pix_fmt, SDL_BlendMode *sdl_blendmode)
 {
     int i;
-    *sdl_blendmode = SDL_BLENDMODE_NONE;
+    *sdl_blendmode = SDL_BLENDMODE_NONE;  // 混合模式 // 不启用透明度混合
     *sdl_pix_fmt = SDL_PIXELFORMAT_UNKNOWN;
     if (format == AV_PIX_FMT_RGB32   ||
         format == AV_PIX_FMT_RGB32_1 ||
         format == AV_PIX_FMT_BGR32   ||
         format == AV_PIX_FMT_BGR32_1)
         *sdl_blendmode = SDL_BLENDMODE_BLEND;
+    // 通过遍历静态数组 sdl_texture_format_map，匹配 FFmpeg 与 SDL 的像素格式对应关系
     for (i = 0; i < FF_ARRAY_ELEMS(sdl_texture_format_map); i++) {
         if (format == sdl_texture_format_map[i].format) {
             *sdl_pix_fmt = sdl_texture_format_map[i].texture_fmt;
@@ -1010,21 +1029,30 @@ static void get_sdl_pix_fmt_and_blendmode(int format, Uint32 *sdl_pix_fmt, SDL_B
     }
 }
 
+// AVFrame 视频帧数据‌ 上传到 ‌SDL 纹理（SDL_Texture）‌，支持多种像素格式（如 YUV、RGB）和内存布局（正向/逆向存储）
 static int upload_texture(SDL_Texture **tex, AVFrame *frame)
 {
     int ret = 0;
     Uint32 sdl_pix_fmt;
     SDL_BlendMode sdl_blendmode;
-    get_sdl_pix_fmt_and_blendmode(frame->format, &sdl_pix_fmt, &sdl_blendmode);
+    get_sdl_pix_fmt_and_blendmode(frame->format, &sdl_pix_fmt, &sdl_blendmode); // 转换 FFmpeg 像素格式到 SDL 支持的格式，并确定混合模式
+    // 重新分配纹理（若格式或尺寸变化）
     if (realloc_texture(tex, sdl_pix_fmt == SDL_PIXELFORMAT_UNKNOWN ? SDL_PIXELFORMAT_ARGB8888 : sdl_pix_fmt, frame->width, frame->height, sdl_blendmode, 0) < 0)
         return -1;
+    // 根据像素格式和内存布局，调用 SDL API 更新纹理数据
     switch (sdl_pix_fmt) {
         case SDL_PIXELFORMAT_IYUV:
+        // 内存布局处理‌
+        // ‌正向存储‌（linesize > 0）：直接传递数据指针和步长。
+        // 逆向存储‌（linesize < 0）
             if (frame->linesize[0] > 0 && frame->linesize[1] > 0 && frame->linesize[2] > 0) {
                 ret = SDL_UpdateYUVTexture(*tex, NULL, frame->data[0], frame->linesize[0],
                                                        frame->data[1], frame->linesize[1],
                                                        frame->data[2], frame->linesize[2]);
+            // 调整数据指针到内存末尾，并通过负步长逆向读取数据（兼容倒序存储的视频帧）
             } else if (frame->linesize[0] < 0 && frame->linesize[1] < 0 && frame->linesize[2] < 0) {
+                // 计算 UV 平面的起始位置（YUV420 的 UV 平面高度为 Y 的一半）
+                // AV_CEIL_RSHIFT(frame->height, 1)  // 等效于 (frame->height + 1) / 2
                 ret = SDL_UpdateYUVTexture(*tex, NULL, frame->data[0] + frame->linesize[0] * (frame->height                    - 1), -frame->linesize[0],
                                                        frame->data[1] + frame->linesize[1] * (AV_CEIL_RSHIFT(frame->height, 1) - 1), -frame->linesize[1],
                                                        frame->data[2] + frame->linesize[2] * (AV_CEIL_RSHIFT(frame->height, 1) - 1), -frame->linesize[2]);
@@ -1050,6 +1078,7 @@ static enum AVColorSpace sdl_supported_color_spaces[] = {
     AVCOL_SPC_SMPTE170M,
 };
 
+// 根据 AVFrame 的颜色空间属性动态设置 SDL 的 YUV 转换模式，确保 YUV 到 RGB 的渲染符合视频源的色彩标准
 static void set_sdl_yuv_conversion_mode(AVFrame *frame)
 {
 #if SDL_VERSION_ATLEAST(2,0,8)
