@@ -174,12 +174,12 @@ typedef struct Frame {
 
 typedef struct FrameQueue {
     Frame queue[FRAME_QUEUE_SIZE];
-    int rindex;
+    int rindex; // （读索引）：指向当前‌待消费帧‌的位置，表示队列中下一个将被取出处理的帧的索引。
     int windex;
     int size;
     int max_size;
     int keep_last; // shifou保留最后一帧 注意
-    int rindex_shown;
+    int rindex_shown; // 已显示读索引：指向‌当前已显示帧‌的位置
     SDL_mutex *mutex;
     SDL_cond *cond;
     PacketQueue *pktq;
@@ -828,18 +828,19 @@ static void frame_queue_signal(FrameQueue *f)
     SDL_CondSignal(f->cond); // 与与 SDL_CondWait 配对使用 发送信号
     SDL_UnlockMutex(f->mutex);
 }
-
+// 获取队列中第一个待显示的帧 帧头 
 static Frame *frame_queue_peek(FrameQueue *f)
 {
     return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
 }
 
+// 预取下一个可读帧(队头后一帧)，作用 提前分析后续帧的问题，实现帧间差值计算或缓冲状态预判
 static Frame *frame_queue_peek_next(FrameQueue *f)
 {
     return &f->queue[(f->rindex + f->rindex_shown + 1) % f->max_size];
 }
-//f->rindex_shown: 当前显示偏移量（通常 0 或 1）
-// 获取最新的可用帧
+
+// 获取最新的有效可用帧(队尾的帧)， 优先显示，确保最低延迟。
 static Frame *frame_queue_peek_last(FrameQueue *f)
 {
     return &f->queue[f->rindex];
@@ -1095,14 +1096,15 @@ static void set_sdl_yuv_conversion_mode(AVFrame *frame)
 #endif
 }
 
+// 视频播放器中负责渲染当前视频帧及叠加字幕的核心模块
 static void video_image_display(VideoState *is)
 {
     Frame *vp;
     Frame *sp = NULL;
     SDL_Rect rect;
 
-    vp = frame_queue_peek_last(&is->pictq);
-    if (vk_renderer) {
+    vp = frame_queue_peek_last(&is->pictq); // 获取最新的一帧 队列中最新/最后插入的帧（即当前应该显示的帧）
+    if (vk_renderer) { // Vulkan渲染优先
         vk_renderer_display(vk_renderer, vp->frame);
         return;
     }
@@ -1110,12 +1112,14 @@ static void video_image_display(VideoState *is)
     if (is->subtitle_st) {
         if (frame_queue_nb_remaining(&is->subpq) > 0) {
             sp = frame_queue_peek(&is->subpq);
-
+            // 校验其显示时间是否匹配视频帧       // 字幕内部偏移，是一个时间点，加起来就是显示的绝对时间点
             if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000)) {
+                // 纹理上传‌：通过SDL_LockTexture和sws_scale将字幕数据写入sub_texture，标记为已上传（sp->uploaded = 1
                 if (!sp->uploaded) {
                     uint8_t* pixels[4];
                     int pitch[4];
                     int i;
+                    // 纹理初始化与尺寸同步
                     if (!sp->width || !sp->height) {
                         sp->width = vp->width;
                         sp->height = vp->height;
@@ -1125,12 +1129,12 @@ static void video_image_display(VideoState *is)
 
                     for (i = 0; i < sp->sub.num_rects; i++) {
                         AVSubtitleRect *sub_rect = sp->sub.rects[i];
-
+                        // ‌边界安全处理‌,裁剪字幕区域以防止越界
                         sub_rect->x = av_clip(sub_rect->x, 0, sp->width );
                         sub_rect->y = av_clip(sub_rect->y, 0, sp->height);
                         sub_rect->w = av_clip(sub_rect->w, 0, sp->width  - sub_rect->x);
                         sub_rect->h = av_clip(sub_rect->h, 0, sp->height - sub_rect->y);
-
+                        // 格式转换‌：使用sws_getCachedContext将字幕的调色板格式（AV_PIX_FMT_PAL8）转换为SDL支持的BGRA格式
                         is->sub_convert_ctx = sws_getCachedContext(is->sub_convert_ctx,
                             sub_rect->w, sub_rect->h, AV_PIX_FMT_PAL8,
                             sub_rect->w, sub_rect->h, AV_PIX_FMT_BGRA,
@@ -1139,7 +1143,9 @@ static void video_image_display(VideoState *is)
                             av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
                             return;
                         }
+                        // 纹理数据高效更新，不锁定有可能导致数据污染，部分更新，线程竞争
                         if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)pixels, pitch)) {
+                            // 将转换后的数据写入纹理中，避免中间缓存
                             sws_scale(is->sub_convert_ctx, (const uint8_t * const *)sub_rect->data, sub_rect->linesize,
                                       0, sub_rect->h, pixels, pitch);
                             SDL_UnlockTexture(is->sub_texture);
@@ -1151,11 +1157,12 @@ static void video_image_display(VideoState *is)
                 sp = NULL;
         }
     }
-
+    // ‌3. 视频帧渲染‌,显示区域计算,适配宽高比
     calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
     set_sdl_yuv_conversion_mode(vp->frame);
 
-    if (!vp->uploaded) {
+    // ‌视频纹理上传‌。若视频帧未上传（vp->uploaded == 0），调用upload_texture将YUV数据转换为SDL纹理（vid_texture
+    if (!vp->uploaded) { // 转换为sdl纹理
         if (upload_texture(&is->vid_texture, vp->frame) < 0) {
             set_sdl_yuv_conversion_mode(NULL);
             return;
@@ -1163,13 +1170,15 @@ static void video_image_display(VideoState *is)
         vp->uploaded = 1;
         vp->flip_v = vp->frame->linesize[0] < 0;
     }
-
+    // 使用SDL_RenderCopyEx渲染视频纹理到目标区域
     SDL_RenderCopyEx(renderer, is->vid_texture, NULL, &rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
     set_sdl_yuv_conversion_mode(NULL);
     if (sp) {
+    // 字幕叠加渲染‌，单次渲染模式（USE_ONEPASS_SUBTITLE_RENDER）‌，直接将整个字幕纹理铺满视频区域
 #if USE_ONEPASS_SUBTITLE_RENDER
         SDL_RenderCopy(renderer, is->sub_texture, NULL, &rect);
 #else
+        //逐区域渲染模式（默认）‌，遍历字幕的每个矩形区域（sp->sub.num_rects），按视频缩放比例调整位置和尺寸后渲染
         int i;
         double xratio = (double)rect.w / (double)sp->width;
         double yratio = (double)rect.h / (double)sp->height;
