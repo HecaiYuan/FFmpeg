@@ -1199,47 +1199,72 @@ static inline int compute_mod(int a, int b)
     return a < 0 ? a%b + b : a%b;
 }
 
+// 将音频数据以波形或者频谱的形式显示出来
 static void video_audio_display(VideoState *s)
 {
+    // 定义多个变量用于循环计数、位置计算、延迟计算、通道数等
     int i, i_start, x, y1, y, ys, delay, n, nb_display_channels;
     int ch, channels, h, h2;
     int64_t time_diff;
     int rdft_bits, nb_freq;
-
+    // 在显示的时候，需要一个特定的区域来绘制这些图形，s->height 就代表了这个显示区域在垂直方向上的像素数量
+    // 计算合适的 rdft_bits，使得 2 的 rdft_bits 次方接近 2 倍的高度
+    // RDFT用于将时域信号转换为频域，生成频谱数据以供显示。变换点数（N）决定了频率分辨率，点数越多，频率分辨率越高，但计算量也越大。
     for (rdft_bits = 1; (1 << rdft_bits) < 2 * s->height; rdft_bits++)
         ;
+    // 计算频谱的频率数量
+    // 在频谱显示模式下，会从音频样本数组中提取 2 * nb_freq 个样本作为输入数据进行实数离散傅里叶变换
+    // 这些频率分量代表了音频信号在不同频率上的能量分布。nb_freq 越大，频谱的分辨率就越高，能够更细致地展示音频信号的频率成分；
+    // 反之，nb_freq 越小，频谱的分辨率就越低，不同频率成分可能会相互重叠。
     nb_freq = 1 << (rdft_bits - 1);
 
     /* compute display index : center on currently output samples */
+    // 获取音频目标通道布局中的通道数
     channels = s->audio_tgt.ch_layout.nb_channels;
+    // 初始化要显示的通道数
     nb_display_channels = channels;
     if (!s->paused) {
-        int data_used= s->show_mode == SHOW_MODE_WAVES ? s->width : (2*nb_freq);
+        // 根据显示模式确定使用的数据量
+        // 如果当前是波形显示模式，data_used 会被设置为显示区域的宽度，后续可能会根据这个宽度来遍历音频样本数组并绘制波形；
+        // 如果是其他模式（如频谱显示模式），data_used 会被设置为 2 * nb_freq，
+        int data_used = s->show_mode == SHOW_MODE_WAVES ? s->width : (2 * nb_freq);
+        // 每个样本的字节数
         n = 2 * channels;
+        // 音频写入缓冲区的大小
         delay = s->audio_write_buf_size;
+        // 计算延迟的样本数
         delay /= n;
 
         /* to be more precise, we take into account the time spent since
            the last buffer computation */
         if (audio_callback_time) {
+            // 计算自上次音频回调以来的时间差
             time_diff = av_gettime_relative() - audio_callback_time;
+            // 根据时间差调整延迟
             delay -= (time_diff * s->audio_tgt.freq) / 1000000;
         }
 
+        // 增加延迟以确保有足够的数据显示
         delay += 2 * data_used;
         if (delay < data_used)
             delay = data_used;
 
-        i_start= x = compute_mod(s->sample_array_index - delay * channels, SAMPLE_ARRAY_SIZE);
+        // 计算起始索引
+        i_start = x = compute_mod(s->sample_array_index - delay * channels, SAMPLE_ARRAY_SIZE);
         if (s->show_mode == SHOW_MODE_WAVES) {
+            // 初始化最大得分
             h = INT_MIN;
             for (i = 0; i < 1000; i += channels) {
+                // 计算样本数组的索引
                 int idx = (SAMPLE_ARRAY_SIZE + x - i) % SAMPLE_ARRAY_SIZE;
+                // 获取不同位置的样本值
                 int a = s->sample_array[idx];
                 int b = s->sample_array[(idx + 4 * channels) % SAMPLE_ARRAY_SIZE];
                 int c = s->sample_array[(idx + 5 * channels) % SAMPLE_ARRAY_SIZE];
                 int d = s->sample_array[(idx + 9 * channels) % SAMPLE_ARRAY_SIZE];
+                // 计算得分
                 int score = a - d;
+                // 如果得分更高且满足条件，则更新最大得分和起始索引
                 if (h < score && (b ^ c) < 0) {
                     h = score;
                     i_start = idx;
@@ -1247,105 +1272,146 @@ static void video_audio_display(VideoState *s)
             }
         }
 
+        // 记录最后一次的起始索引
         s->last_i_start = i_start;
     } else {
+        // 如果处于暂停状态，使用上次记录的起始索引
         i_start = s->last_i_start;
     }
 
-    if (s->show_mode == SHOW_MODE_WAVES) {
+    if (s->show_mode == SHOW_MODE_WAVES) {  // 波形模式：直接绘制原始音频波形
+        // 设置渲染颜色为白色
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
 
         /* total height for one channel */
+        // 计算每个通道的总高度
         h = s->height / nb_display_channels;
         /* graph height / 2 */
+        // 计算波形图高度的一半
         h2 = (h * 9) / 20;
         for (ch = 0; ch < nb_display_channels; ch++) {
+            // 初始化样本数组的索引
             i = i_start + ch;
+            // 计算中心线的位置
             y1 = s->ytop + ch * h + (h / 2); /* position of center line */
             for (x = 0; x < s->width; x++) {
+                // 计算波形的高度
                 y = (s->sample_array[i] * h2) >> 15;
                 if (y < 0) {
+                    // 如果高度为负，取绝对值并调整绘制位置
                     y = -y;
                     ys = y1 - y;
                 } else {
                     ys = y1;
                 }
+                // 绘制矩形表示波形
                 fill_rectangle(s->xleft + x, ys, 1, y);
+                // 更新样本数组的索引
                 i += channels;
                 if (i >= SAMPLE_ARRAY_SIZE)
                     i -= SAMPLE_ARRAY_SIZE;
             }
         }
 
+        // 设置渲染颜色为蓝色
         SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
 
         for (ch = 1; ch < nb_display_channels; ch++) {
+            // 计算分割线的位置
             y = s->ytop + ch * h;
+            // 绘制分割线
             fill_rectangle(s->xleft, y, s->width, 1);
         }
-    } else {
+    } else { // 频谱模式：使用实数傅里叶变换(RDFT)生成频谱图
         int err = 0;
+        // 重新分配纹理
         if (realloc_texture(&s->vis_texture, SDL_PIXELFORMAT_ARGB8888, s->width, s->height, SDL_BLENDMODE_NONE, 1) < 0)
             return;
 
         if (s->xpos >= s->width)
+            // 如果 x 位置超出宽度，重置为 0
             s->xpos = 0;
-        nb_display_channels= FFMIN(nb_display_channels, 2);
+        // 限制显示的通道数
+        nb_display_channels = FFMIN(nb_display_channels, 2);
         if (rdft_bits != s->rdft_bits) {
+            // RDFT 缩放因子
             const float rdft_scale = 1.0;
+            // 释放之前的 RDFT 资源
             av_tx_uninit(&s->rdft);
             av_freep(&s->real_data);
             av_freep(&s->rdft_data);
+            // 更新 rdft_bits
             s->rdft_bits = rdft_bits;
-            s->real_data = av_malloc_array(nb_freq, 4 *sizeof(*s->real_data));
-            s->rdft_data = av_malloc_array(nb_freq + 1, 2 *sizeof(*s->rdft_data));
+            // 分配新的实部数据缓冲区
+            s->real_data = av_malloc_array(nb_freq, 4 * sizeof(*s->real_data));
+            // 分配新的 RDFT 数据缓冲区
+            s->rdft_data = av_malloc_array(nb_freq + 1, 2 * sizeof(*s->rdft_data));
+            // 初始化 RDFT
             err = av_tx_init(&s->rdft, &s->rdft_fn, AV_TX_FLOAT_RDFT,
                              0, 1 << rdft_bits, &rdft_scale, 0);
         }
         if (err < 0 || !s->rdft_data) {
+            // 如果初始化失败或缓冲区分配失败，切换到波形显示模式
             av_log(NULL, AV_LOG_ERROR, "Failed to allocate buffers for RDFT, switching to waves display\n");
             s->show_mode = SHOW_MODE_WAVES;
         } else {
             float *data_in[2];
             AVComplexFloat *data[2];
+            // 定义要更新的矩形区域
             SDL_Rect rect = {.x = s->xpos, .y = 0, .w = 1, .h = s->height};
             uint32_t *pixels;
             int pitch;
             for (ch = 0; ch < nb_display_channels; ch++) {
+                // 初始化输入数据指针
                 data_in[ch] = s->real_data + 2 * nb_freq * ch;
+                // 初始化输出数据指针
                 data[ch] = s->rdft_data + nb_freq * ch;
+                // 初始化样本数组的索引
                 i = i_start + ch;
                 for (x = 0; x < 2 * nb_freq; x++) {
-                    double w = (x-nb_freq) * (1.0 / nb_freq);
+                    // 应用窗函数
+                    double w = (x - nb_freq) * (1.0 / nb_freq);
                     data_in[ch][x] = s->sample_array[i] * (1.0 - w * w);
+                    // 更新样本数组的索引
                     i += channels;
                     if (i >= SAMPLE_ARRAY_SIZE)
                         i -= SAMPLE_ARRAY_SIZE;
                 }
+                // 执行 RDFT 变换
                 s->rdft_fn(s->rdft, data[ch], data_in[ch], sizeof(float));
+                // 处理 RDFT 结果
                 data[ch][0].im = data[ch][nb_freq].re;
                 data[ch][nb_freq].re = 0;
             }
             /* Least efficient way to do this, we should of course
              * directly access it but it is more than fast enough. */
             if (!SDL_LockTexture(s->vis_texture, &rect, (void **)&pixels, &pitch)) {
+                // 计算像素间距
                 pitch >>= 2;
+                // 移动到纹理的最后一行
                 pixels += pitch * s->height;
                 for (y = 0; y < s->height; y++) {
+                    // 计算幅度
                     double w = 1 / sqrt(nb_freq);
                     int a = sqrt(w * sqrt(data[0][y].re * data[0][y].re + data[0][y].im * data[0][y].im));
-                    int b = (nb_display_channels == 2 ) ? sqrt(w * hypot(data[1][y].re, data[1][y].im))
+                    int b = (nb_display_channels == 2) ? sqrt(w * hypot(data[1][y].re, data[1][y].im))
                                                         : a;
+                    // 限制幅度在 0 - 255 之间
                     a = FFMIN(a, 255);
                     b = FFMIN(b, 255);
+                    // 移动到上一行
                     pixels -= pitch;
-                    *pixels = (a << 16) + (b << 8) + ((a+b) >> 1);
+                    // 设置像素颜色
+                    *pixels = (a << 16) + (b << 8) + ((a + b) >> 1);
                 }
+                // 解锁纹理
                 SDL_UnlockTexture(s->vis_texture);
             }
+            // 将纹理复制到渲染目标
             SDL_RenderCopy(renderer, s->vis_texture, NULL, NULL);
         }
         if (!s->paused)
+            // 如果未暂停，更新 x 位置
             s->xpos++;
     }
 }
@@ -1361,8 +1427,8 @@ static void stream_component_close(VideoState *is, int stream_index)
 
     switch (codecpar->codec_type) {
     case AVMEDIA_TYPE_AUDIO:
-        decoder_abort(&is->auddec, &is->sampq);
-        SDL_CloseAudioDevice(audio_dev);
+        decoder_abort(&is->auddec, &is->sampq); // 终止解码过程
+        SDL_CloseAudioDevice(audio_dev);  // 关闭音频设备
         decoder_destroy(&is->auddec);
         swr_free(&is->swr_ctx);
         av_freep(&is->audio_buf1);
