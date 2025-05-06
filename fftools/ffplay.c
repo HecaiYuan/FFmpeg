@@ -174,12 +174,12 @@ typedef struct Frame {
 
 typedef struct FrameQueue {
     Frame queue[FRAME_QUEUE_SIZE];
-    int rindex; // （读索引）：指向当前‌待消费帧‌的位置，表示队列中下一个将被取出处理的帧的索引。
+    int rindex; // （读索引）：指向当前待消费帧的位置，表示队列中下一个将被取出处理的帧的索引。
     int windex;
     int size;
     int max_size;
-    int keep_last; // shifou保留最后一帧 注意
-    int rindex_shown; // 已显示读索引：指向‌当前已显示帧‌的位置
+    int keep_last; // shifou保留最后一帧注意
+    int rindex_shown; // 已显示读索引：指向当前已显示帧的位置
     SDL_mutex *mutex;
     SDL_cond *cond;
     PacketQueue *pktq;
@@ -218,7 +218,7 @@ typedef struct VideoState {
     int seek_flags;
     int64_t seek_pos;
     int64_t seek_rel;
-    int read_pause_return; // // 是否请求附带图片（如MP3或AAC文件的专辑封面等）
+    int read_pause_return; // 是否请求附带图片（如MP3或AAC文件的专辑封面等）
     AVFormatContext *ic;
     int realtime;
 
@@ -250,7 +250,7 @@ typedef struct VideoState {
     uint8_t *audio_buf;
     uint8_t *audio_buf1;
     unsigned int audio_buf_size; /* in bytes */ // 音频缓冲区
-    unsigned int audio_buf1_size;  // // 重采样音频缓冲区
+    unsigned int audio_buf1_size;  // 重采样音频缓冲区
     int audio_buf_index; /* in bytes */ // 音频缓冲区大小
     int audio_write_buf_size; // 重采样音频缓冲区大小
     int audio_volume;
@@ -259,7 +259,7 @@ typedef struct VideoState {
     struct AudioParams audio_filter_src;
     struct AudioParams audio_tgt;
     struct SwrContext *swr_ctx;
-    int frame_drops_early; // // 解码器队列中由于同步问题而提前丢弃的帧
+    int frame_drops_early; // 解码器队列中由于同步问题而提前丢弃的帧
     int frame_drops_late; // 由于播放延迟而丢弃的帧
 
     enum ShowMode {
@@ -324,11 +324,11 @@ static int video_disable;
 static int subtitle_disable;
 static const char* wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
 static int seek_by_bytes = -1; // 表示是否按字节进行跳转
-static float seek_interval = 10; // 默认跳转间隔 10s
+static float seek_interval = 10; // 默认跳转间隔10s
 static int display_disable;
 static int borderless;  // 标志位，用于表示是否创建无边框窗口
 static int alwaysontop; // 表示播放器窗口是否始终置顶
-static int startup_volume = 100;  // ，代表播放器启动时的音量大小，取值范围通常是 0 到 100
+static int startup_volume = 100;  // ，代表播放器启动时的音量大小，取值范围通常是0到100
 static int show_status = -1;
 static int av_sync_type = AV_SYNC_AUDIO_MASTER;
 static int64_t start_time = AV_NOPTS_VALUE;
@@ -373,7 +373,7 @@ static SDL_AudioDeviceID audio_dev;
 
 static VkRenderer *vk_renderer;
 
-// 建立 FFmpeg 像素格式（AVPixelFormat）和 SDL 像素格式之间的映射关系
+// 建立FFmpeg像素格式（AVPixelFormat）和SDL像素格式之间的映射关系
 static const struct TextureFormatEntry {
     enum AVPixelFormat format;
     int texture_fmt;
@@ -443,15 +443,15 @@ static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
     if (ret < 0)
         return ret;
     q->nb_packets++;
-    q->size += pkt1.pkt->size + sizeof(pkt1); // 总大小
-    q->duration += pkt1.pkt->duration;  // 总时长
+    q->size += pkt1.pkt->size + sizeof(pkt1); // 总大小 累加
+    q->duration += pkt1.pkt->duration;  // 总时长 累加
     /* XXX: should duplicate packet data in DV case */
     SDL_CondSignal(q->cond);
     return 0;
 }
 
 // 一个 AVPacket 数据包安全地放入 PacketQueue 队列中，使用零拷贝技术优化性能，
-// 并在多线程环境下保证线程安全
+// 并在多线程环境下保证线程安全 转移数据所有权
 static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
 {
     AVPacket *pkt1;
@@ -475,7 +475,7 @@ static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
 }
 
 /*
-向指定流（如音频、视频、字幕）的 PacketQueue 中放入一个空数据包（Null Packet）‌，
+向指定流（如音频、视频、字幕）的 PacketQueue 中放入一个空数据包（Null Packet），
 主要用于触发解码器处理流的终止或刷新状态
 空包的作用：空包（AVPacket 类型）的 data 和 size 字段通常为空，
 用于通知解码器当前流已结束或需要立即刷新缓存帧（如 FLUSH 操作)或则拖动进度或切换流时，
@@ -511,10 +511,10 @@ static int packet_queue_init(PacketQueue *q)
 }
 
 // 清空队列，在seek时
-// 如果 直接释放 1. 引发内存泄漏或引用计数错误
-//  队列底层数据结构限制‌，AVFifo 特性‌：PacketQueue 使用 AVFifo 作为底层容器（基于循环数组实现），
+// 如果直接释放 1. 引发内存泄漏或引用计数错误
+// 队列底层数据结构限制，AVFifo 特性：PacketQueue 使用 AVFifo 作为底层容器（基于循环数组实现），
 // 其存储方式为二进制数据块而非指针数组4。直接释放整个 AVFifo 缓冲区会导致内存泄漏，因 AVPacket 对象需单独释放4。
-‌// 元素独立性‌：队列中的每个 MyAVPacketList 元素均通过 av_fifo_write 写入，需通过 av_fifo_read 逐个取出以触发正确的内存释放逻辑。
+// 元素独立性：队列中的每个 MyAVPacketList 元素均通过 av_fifo_write 写入，需通过 av_fifo_read 逐个取出以触发正确的内存释放逻辑。
 static void packet_queue_flush(PacketQueue *q)
 {
     MyAVPacketList pkt1;
@@ -531,8 +531,8 @@ static void packet_queue_flush(PacketQueue *q)
 
 static void packet_queue_destroy(PacketQueue *q)
 {
-    packet_queue_flush(q); // 先清除数据再进行释放内存
-    av_fifo_freep2(&q->pkt_list); // 销毁 AVFifoBuffer 结构体，释放底层内存
+    packet_queue_flush(q);  // 先通过 flush 操作释放所有数据包引用计数，避免缓冲区残留导致内存泄漏
+    av_fifo_freep2(&q->pkt_list); // 销毁存储容器 AVFifo 释放其内部数据缓冲区（buffer 字段）占用的内存
     SDL_DestroyMutex(q->mutex);
     SDL_DestroyCond(q->cond);
 }
@@ -634,7 +634,7 @@ B帧处理	   自动修正显示时序	     需配合PTS使用
 static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
     int ret = AVERROR(EAGAIN); // 初始化返回值为EAGAIN
 
-    for (;;) {
+    for (;;) { // 1. 判断是否是同一个serial
         if (d->queue->serial == d->pkt_serial) {
             do {
                 // 检查中止请求
@@ -646,21 +646,24 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                         // 从已初始化的解码器(AVCodecContext)中获取解码后的帧数据(AVFrame)
                         ret = avcodec_receive_frame(d->avctx, frame);
                         if (ret >= 0) {
-                            // 时间戳处理 解码后的帧需要转换为播放时间基
+                            // 根据decoder_reorder_pts参数选择时间戳生成策略
                             if (decoder_reorder_pts == -1) {
                                 frame->pts = frame->best_effort_timestamp; // 启发式估算
                             } else if (!decoder_reorder_pts) {
-                                frame->pts = frame->pkt_dts; // // 使用解码时间戳
+                                frame->pts = frame->pkt_dts; // 使用解码时间戳
                             }
                         }
                         break;
                     case AVMEDIA_TYPE_AUDIO:
                         ret = avcodec_receive_frame(d->avctx, frame);
                         if (ret >= 0) {
-                            // // 时间戳转换 解码后的帧需要转换为播放时间基
+                            // 时间戳转换 解码后的帧需要转换为播放时间基
+                            // 将解码后的音频帧的PTS转换为基于音频采样率的时间基（tb = {1, sample_rate}），确保时间戳单位统一，便于后续播放。
                             AVRational tb = (AVRational){1, frame->sample_rate}; // 音频帧的采样率
                             if (frame->pts != AV_NOPTS_VALUE)
                                 // 完成音频帧时间基转换和连续时间戳生成
+                                // 通过 av_rescale_q 函数将音频帧的 PTS 从编解码器包时间基（d->avctx->pkt_timebase）
+                                // 转换为音频采样率时间基（tb），确保时间戳单位统一为音频播放所需的基准
                                 // av_rescale_q(a,b,c)实现公式：a * b / c，完成时间单位的等比缩放
                                 frame->pts = av_rescale_q(frame->pts, d->avctx->pkt_timebase, tb);
                             // 当帧无有效PTS时（如原始流未包含或解码错误），使用解码器缓存的预测值
@@ -668,8 +671,8 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                                 frame->pts = av_rescale_q(d->next_pts, d->next_pts_tb, tb);
                             // 更新下一帧的预期pts
                             if (frame->pts != AV_NOPTS_VALUE) {
-                            // 而音频帧的PTS严格遵循采样点线性增长，因此可直接相加
-                            // 直接相加结果的单位是采样点数量
+                                // 而音频帧的PTS严格遵循采样点线性增长，因此可直接相加
+                                // 直接相加结果的单位是采样点数量
                                 d->next_pts = frame->pts + frame->nb_samples;
                                 d->next_pts_tb = tb;
                             }
@@ -689,14 +692,14 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
         // 获取输入数据包
         // 数据包获取与序列号同步逻辑，主要用于解码线程从队列获取压缩数据包时的状态管理
         /*
-整体流程总结
-队列状态检测 → 空队列时唤醒生产者13
-数据包获取 → 处理pending或从队列拉取新包2
-序列号校验 → 变化时清空解码器并重置状态23
-有效性过滤 → 仅处理序列号匹配的包，其余丢弃3
-*/
+          整体流程总结
+          队列状态检测 → 空队列时唤醒生产者
+          数据包获取   → 处理pending或从队列拉取新包
+          序列号校验   → 变化时清空解码器并重置状态
+          有效性过滤   → 仅处理序列号匹配的包，其余丢弃
+        */
         do {
-            if (d->queue->nb_packets == 0) // 如果队列是空的 通知县城进行补充
+            if (d->queue->nb_packets == 0) // 如果队列是空的 通知线程进行补充
                 SDL_CondSignal(d->empty_queue_cond);
             // 处理未处理完的数据包，通常是解码失败
             if (d->packet_pending) {
@@ -705,7 +708,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                 int old_serial = d->pkt_serial;
                 if (packet_queue_get(d->queue, d->pkt, 1, &d->pkt_serial) < 0)
                     return -1;
-                // 序列号变化处理
+                // 验证数据包序列号一致性
                 if (old_serial != d->pkt_serial) {
                     avcodec_flush_buffers(d->avctx);
                     d->finished = 0;
@@ -791,15 +794,15 @@ static int frame_queue_init(FrameQueue *f, PacketQueue *pktq, int max_size, int 
 /*
 销毁FrameQueue结构体及其所有关联资源，包括：
 
-释放队列中所有AVFrame对象12
+释放队列中所有AVFrame对象
 销毁线程同步原语（互斥锁和条件变量）
 
 1. 代码可维护性优化
 统一访问接口：frame_queue_unref_item是专门处理Frame类型资源的函数，通过指针参数传递队列元素，保持与队列其他操作（如push/pop）一致的访问方式13
-隔离实现细节：避免在销毁函数中直接操作f->queue[i]的内部字段，降低队列数据结构变更带来的影响36
+隔离实现细节：避免在销毁函数中直接操作f->queue[i]的内部字段，降低队列数据结构变更带来的影响
 2. 线程安全兼容性
-指针传递的原子性：获取数组元素地址的操作是原子性的，而直接操作数组元素可能涉及多步内存访问（如计算偏移量），在未加锁环境下存在风险15
-与初始化对称：frame_queue_init中同样通过指针初始化队列元素，保持生命周期管理的一致性36
+指针传递的原子性：获取数组元素地址的操作是原子性的，而直接操作数组元素可能涉及多步内存访问（如计算偏移量），在未加锁环境下存在风险
+与初始化对称：frame_queue_init中同样通过指针初始化队列元素，保持生命周期管理的一致性
 */
 static void frame_queue_destroy(FrameQueue *f)
 {
@@ -825,16 +828,16 @@ static void frame_queue_destroy(FrameQueue *f)
 static void frame_queue_signal(FrameQueue *f)
 {
     SDL_LockMutex(f->mutex);
-    SDL_CondSignal(f->cond); // 与与 SDL_CondWait 配对使用 发送信号
+    SDL_CondSignal(f->cond); // 与SDL_CondWait配对使用 发送信号
     SDL_UnlockMutex(f->mutex);
 }
-// 获取队列中第一个待显示的帧 帧头 
+// 获取队列中第一个待显示的帧 帧头
 static Frame *frame_queue_peek(FrameQueue *f)
 {
     return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
 }
 
-// 预取下一个可读帧(队头后一帧)，作用 提前分析后续帧的问题，实现帧间差值计算或缓冲状态预判
+// 预取下一个可读帧(队头后一帧)，作用:提前分析后续帧的问题，实现帧间差值计算或缓冲状态预判
 static Frame *frame_queue_peek_next(FrameQueue *f)
 {
     return &f->queue[(f->rindex + f->rindex_shown + 1) % f->max_size];
@@ -976,7 +979,7 @@ static int realloc_texture(SDL_Texture **texture, Uint32 new_format, int new_wid
     return 0;
 }
 
-// 根据视频的 ‌样本宽高比（SAR）‌ 和图像尺寸，结合屏幕参数，计算视频在屏幕上居中显示时的 ‌位置‌ 和 ‌缩放尺寸‌，并确保宽高为偶数（兼容 YUV 格式）
+// 根据视频的样本宽高比(SAR)和图像尺寸，结合屏幕参数，计算视频在屏幕上居中显示时的位置和缩放尺寸，并确保宽高为偶数（兼容YUV格式）
 static void calculate_display_rect(SDL_Rect *rect,
                                    int scr_xleft, int scr_ytop, int scr_width, int scr_height,
                                    int pic_width, int pic_height, AVRational pic_sar)
@@ -1009,8 +1012,8 @@ static void calculate_display_rect(SDL_Rect *rect,
     rect->h = FFMAX((int)height, 1);
 }
 
-// 该函数用于将 ‌FFmpeg 像素格式‌（AV_PIX_FMT）转换为 ‌SDL 纹理像素格式‌（SDL_PIXELFORMAT），并根据格式特性设置 ‌混合模式
-// FFmpeg 与 SDL 渲染管线衔接的关键环节‌
+// 该函数用于将FFmpeg 像素格式（AV_PIX_FMT）转换为SDL纹理像素格式（SDL_PIXELFORMAT）并根据格式特性设置混合模式
+// FFmpeg 与 SDL 渲染管线衔接的关键环节
 static void get_sdl_pix_fmt_and_blendmode(int format, Uint32 *sdl_pix_fmt, SDL_BlendMode *sdl_blendmode)
 {
     int i;
@@ -1030,7 +1033,7 @@ static void get_sdl_pix_fmt_and_blendmode(int format, Uint32 *sdl_pix_fmt, SDL_B
     }
 }
 
-// AVFrame 视频帧数据‌ 上传到 ‌SDL 纹理（SDL_Texture）‌，支持多种像素格式（如 YUV、RGB）和内存布局（正向/逆向存储）
+// AVFrame 视频帧数据上传到SDL纹理（SDL_Texture)，支持多种像素格式（如 YUV、RGB）和内存布局（正向/逆向存储）
 static int upload_texture(SDL_Texture **tex, AVFrame *frame)
 {
     int ret = 0;
@@ -1043,9 +1046,9 @@ static int upload_texture(SDL_Texture **tex, AVFrame *frame)
     // 根据像素格式和内存布局，调用 SDL API 更新纹理数据
     switch (sdl_pix_fmt) {
         case SDL_PIXELFORMAT_IYUV:
-        // 内存布局处理‌
-        // ‌正向存储‌（linesize > 0）：直接传递数据指针和步长。
-        // 逆向存储‌（linesize < 0）
+            // 内存布局处理
+            // 正向存储（linesize > 0）：直接传递数据指针和步长。
+            // 逆向存储（linesize < 0）
             if (frame->linesize[0] > 0 && frame->linesize[1] > 0 && frame->linesize[2] > 0) {
                 ret = SDL_UpdateYUVTexture(*tex, NULL, frame->data[0], frame->linesize[0],
                                                        frame->data[1], frame->linesize[1],
@@ -1114,7 +1117,7 @@ static void video_image_display(VideoState *is)
             sp = frame_queue_peek(&is->subpq);
             // 校验其显示时间是否匹配视频帧       // 字幕内部偏移，是一个时间点，加起来就是显示的绝对时间点
             if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000)) {
-                // 纹理上传‌：通过SDL_LockTexture和sws_scale将字幕数据写入sub_texture，标记为已上传（sp->uploaded = 1
+                // 纹理上传：通过SDL_LockTexture和sws_scale将字幕数据写入sub_texture，标记为已上传（sp->uploaded = 1
                 if (!sp->uploaded) {
                     uint8_t* pixels[4];
                     int pitch[4];
@@ -1129,12 +1132,12 @@ static void video_image_display(VideoState *is)
 
                     for (i = 0; i < sp->sub.num_rects; i++) {
                         AVSubtitleRect *sub_rect = sp->sub.rects[i];
-                        // ‌边界安全处理‌,裁剪字幕区域以防止越界
+                        // 边界安全处理,裁剪字幕区域以防止越界
                         sub_rect->x = av_clip(sub_rect->x, 0, sp->width );
                         sub_rect->y = av_clip(sub_rect->y, 0, sp->height);
                         sub_rect->w = av_clip(sub_rect->w, 0, sp->width  - sub_rect->x);
                         sub_rect->h = av_clip(sub_rect->h, 0, sp->height - sub_rect->y);
-                        // 格式转换‌：使用sws_getCachedContext将字幕的调色板格式（AV_PIX_FMT_PAL8）转换为SDL支持的BGRA格式
+                        // 格式转换：使用sws_getCachedContext将字幕的调色板格式（AV_PIX_FMT_PAL8）转换为SDL支持的BGRA格式
                         is->sub_convert_ctx = sws_getCachedContext(is->sub_convert_ctx,
                             sub_rect->w, sub_rect->h, AV_PIX_FMT_PAL8,
                             sub_rect->w, sub_rect->h, AV_PIX_FMT_BGRA,
@@ -1157,11 +1160,11 @@ static void video_image_display(VideoState *is)
                 sp = NULL;
         }
     }
-    // ‌3. 视频帧渲染‌,显示区域计算,适配宽高比
+    // 3. 视频帧渲染,显示区域计算,适配宽高比
     calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
     set_sdl_yuv_conversion_mode(vp->frame);
 
-    // ‌视频纹理上传‌。若视频帧未上传（vp->uploaded == 0），调用upload_texture将YUV数据转换为SDL纹理（vid_texture
+    // 视频纹理上传。若视频帧未上传（vp->uploaded == 0），调用upload_texture将YUV数据转换为SDL纹理（vid_texture
     if (!vp->uploaded) { // 转换为sdl纹理
         if (upload_texture(&is->vid_texture, vp->frame) < 0) {
             set_sdl_yuv_conversion_mode(NULL);
@@ -1174,7 +1177,7 @@ static void video_image_display(VideoState *is)
     SDL_RenderCopyEx(renderer, is->vid_texture, NULL, &rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
     set_sdl_yuv_conversion_mode(NULL);
     if (sp) {
-    // 字幕叠加渲染‌，单次渲染模式（USE_ONEPASS_SUBTITLE_RENDER）‌，直接将整个字幕纹理铺满视频区域
+    // 字幕叠加渲染，单次渲染模式（USE_ONEPASS_SUBTITLE_RENDER)，直接将整个字幕纹理铺满视频区域
 #if USE_ONEPASS_SUBTITLE_RENDER
         SDL_RenderCopy(renderer, is->sub_texture, NULL, &rect);
 #else
@@ -1416,71 +1419,85 @@ static void video_audio_display(VideoState *s)
     }
 }
 
+// 此函数是多媒体播放器中流管理的核心组件，通过分类型资源释放和状态重置，确保系统资源的合理回收与播放状态的稳定性
 static void stream_component_close(VideoState *is, int stream_index)
 {
-    AVFormatContext *ic = is->ic;
-    AVCodecParameters *codecpar;
+    AVFormatContext *ic = is->ic;  // 输入媒体文件的格式上下文
+    AVCodecParameters *codecpar;   // 流的编解码参数
 
+    // 1. **参数有效性检查**：防止越界访问流数组
     if (stream_index < 0 || stream_index >= ic->nb_streams)
         return;
+
+    // 2. **获取流的编解码参数**
     codecpar = ic->streams[stream_index]->codecpar;
 
+    // 3. **根据流类型释放资源**
     switch (codecpar->codec_type) {
-    case AVMEDIA_TYPE_AUDIO:
-        decoder_abort(&is->auddec, &is->sampq); // 终止解码过程
-        SDL_CloseAudioDevice(audio_dev);  // 关闭音频设备
-        decoder_destroy(&is->auddec);
-        swr_free(&is->swr_ctx);
-        av_freep(&is->audio_buf1);
-        is->audio_buf1_size = 0;
-        is->audio_buf = NULL;
+    case AVMEDIA_TYPE_AUDIO:  // 处理音频流
+        decoder_abort(&is->auddec, &is->sampq);  // 终止音频解码线程，清空采样队列
+        SDL_CloseAudioDevice(audio_dev);         // 关闭SDL音频设备（停止播放）
+        decoder_destroy(&is->auddec);            // 销毁音频解码器上下文
+        swr_free(&is->swr_ctx);                  // 释放音频重采样器（SWResample）
+        av_freep(&is->audio_buf1);               // 释放音频缓冲区1的内存
+        is->audio_buf1_size = 0;                 // 重置缓冲区大小
+        is->audio_buf = NULL;                    // 重置音频数据指针
 
+        // 释放傅里叶变换相关资源（如音频频谱分析）
         if (is->rdft) {
-            av_tx_uninit(&is->rdft);
-            av_freep(&is->real_data);
-            av_freep(&is->rdft_data);
-            is->rdft = NULL;
-            is->rdft_bits = 0;
+            av_tx_uninit(&is->rdft);       // 销毁FFT变换器
+            av_freep(&is->real_data);     // 释放实数数据缓冲区
+            av_freep(&is->rdft_data);     // 释放FFT结果缓冲区
+            is->rdft = NULL;              // 重置指针
+            is->rdft_bits = 0;            // 重置FFT位数
         }
         break;
-    case AVMEDIA_TYPE_VIDEO:
-        decoder_abort(&is->viddec, &is->pictq);
-        decoder_destroy(&is->viddec);
+
+    case AVMEDIA_TYPE_VIDEO:  // 处理视频流
+        decoder_abort(&is->viddec, &is->pictq);  // 终止视频解码线程，清空图像队列
+        decoder_destroy(&is->viddec);            // 销毁视频解码器上下文
         break;
-    case AVMEDIA_TYPE_SUBTITLE:
-        decoder_abort(&is->subdec, &is->subpq);
-        decoder_destroy(&is->subdec);
+
+    case AVMEDIA_TYPE_SUBTITLE:  // 处理字幕流
+        decoder_abort(&is->subdec, &is->subpq);  // 终止字幕解码线程，清空字幕队列
+        decoder_destroy(&is->subdec);             // 销毁字幕解码器上下文
         break;
+
     default:
         break;
     }
 
+    // 4. **标记流为丢弃状态**：通知FFmpeg后续忽略此流的所有数据包
     ic->streams[stream_index]->discard = AVDISCARD_ALL;
+
+    // 5. **重置播放器的流状态**
     switch (codecpar->codec_type) {
     case AVMEDIA_TYPE_AUDIO:
-        is->audio_st = NULL;
-        is->audio_stream = -1;
+        is->audio_st = NULL;       // 清空音频流指针
+        is->audio_stream = -1;    // 重置音频流索引（-1表示未选择）
         break;
     case AVMEDIA_TYPE_VIDEO:
-        is->video_st = NULL;
-        is->video_stream = -1;
+        is->video_st = NULL;      // 清空视频流指针
+        is->video_stream = -1;    // 重置视频流索引
         break;
     case AVMEDIA_TYPE_SUBTITLE:
-        is->subtitle_st = NULL;
-        is->subtitle_stream = -1;
+        is->subtitle_st = NULL;   // 清空字幕流指针
+        is->subtitle_stream = -1; // 重置字幕流索引
         break;
     default:
         break;
     }
 }
-
+/* 此函数通过层级式资源释放和线程同步机制，确保多媒体播放器的安全退出。
+   其核心设计思想是 反向初始化（逆序释放资源），避免依赖残留状态
+*/
 static void stream_close(VideoState *is)
 {
-    /* XXX: use a special url_shutdown call to abort parse cleanly */
-    is->abort_request = 1;
-    SDL_WaitThread(is->read_tid, NULL);
+    /* 1. 终止解复用线程（read_tid）*/
+    is->abort_request = 1;                // 设置全局终止标志，通知线程退出
+    SDL_WaitThread(is->read_tid, NULL);   // 等待解复用线程安全退出 阻塞当前线程 直到等待的线程结束
 
-    /* close each stream */
+    /* 2. 关闭各类型流组件（音频、视频、字幕）*/
     if (is->audio_stream >= 0)
         stream_component_close(is, is->audio_stream);
     if (is->video_stream >= 0)
@@ -1488,53 +1505,90 @@ static void stream_close(VideoState *is)
     if (is->subtitle_stream >= 0)
         stream_component_close(is, is->subtitle_stream);
 
-    avformat_close_input(&is->ic);
+    /* 3. 释放输入媒体文件的格式上下文 */
+    avformat_close_input(&is->ic);        // 关闭输入流，释放 AVFormatContext 及相关资源
 
-    packet_queue_destroy(&is->videoq);
-    packet_queue_destroy(&is->audioq);
-    packet_queue_destroy(&is->subtitleq);
+    /* 4. 销毁数据包队列 */
+    packet_queue_destroy(&is->videoq);    // 清空并销毁视频包队列
+    packet_queue_destroy(&is->audioq);    // 清空并销毁音频包队列
+    packet_queue_destroy(&is->subtitleq); // 清空并销毁字幕包队列
 
-    /* free all pictures */
-    frame_queue_destroy(&is->pictq);
-    frame_queue_destroy(&is->sampq);
-    frame_queue_destroy(&is->subpq);
-    SDL_DestroyCond(is->continue_read_thread);
-    sws_freeContext(is->sub_convert_ctx);
-    av_free(is->filename);
+    /* 5. 销毁帧队列 */
+    frame_queue_destroy(&is->pictq);      // 释放视频帧队列内存
+    frame_queue_destroy(&is->sampq);      // 释放音频采样队列内存
+    frame_queue_destroy(&is->subpq);      // 释放字幕帧队列内存
+
+    /* 6. 销毁同步对象与附加资源 */
+    SDL_DestroyCond(is->continue_read_thread); // 销毁条件变量（用于线程通信）
+    sws_freeContext(is->sub_convert_ctx);      // 释放字幕图像转换器（如缩放/色彩转换）
+
+    /* 7. 释放文件名和纹理资源 */
+    av_free(is->filename);                // 释放媒体文件名字符串内存
     if (is->vis_texture)
-        SDL_DestroyTexture(is->vis_texture);
+        SDL_DestroyTexture(is->vis_texture); // 销毁可视化纹理（如频谱图）
     if (is->vid_texture)
-        SDL_DestroyTexture(is->vid_texture);
+        SDL_DestroyTexture(is->vid_texture); // 销毁视频纹理
     if (is->sub_texture)
-        SDL_DestroyTexture(is->sub_texture);
-    av_free(is);
+        SDL_DestroyTexture(is->sub_texture); // 销毁字幕纹理
+
+    /* 8. 释放 VideoState 结构体自身 */
+    av_free(is);                          // 最后释放播放器全局状态内存
 }
 
+/*
+  do_exit 函数用于 安全终止程序并释放所有已分配的资源，包括媒体流、渲染器、窗口、
+  编解码器参数等，确保无内存泄漏和资源残留
+*/
 static void do_exit(VideoState *is)
 {
+    // 1. 关闭媒体流及相关资源
     if (is) {
-        stream_close(is);
+        stream_close(is); // 调用stream_close关闭视频状态（解复用器、解码器、队列等）
     }
+
+    // 2. 销毁SDL图形渲染器
     if (renderer)
-        SDL_DestroyRenderer(renderer);
+        SDL_DestroyRenderer(renderer); // 释放SDL的2D渲染器（如OpenGL/Direct3D后端）
+
+    // 3. 销毁Vulkan渲染器（如果使用）
     if (vk_renderer)
-        vk_renderer_destroy(vk_renderer);
+        vk_renderer_destroy(vk_renderer); // 自定义Vulkan渲染器销毁逻辑（释放GPU资源）
+
+    // 4. 销毁SDL窗口
     if (window)
-        SDL_DestroyWindow(window);
-    uninit_opts();
+        SDL_DestroyWindow(window); // 关闭应用程序窗口，释放关联的Surface/句柄
+
+    // 5. 反初始化全局选项（如FFmpeg参数）
+    uninit_opts(); // 假设该函数重置全局配置或释放选项相关内存
+
+    // 6. 释放视频滤镜列表内存
     for (int i = 0; i < nb_vfilters; i++)
-        av_freep(&vfilters_list[i]);
-    av_freep(&vfilters_list);
-    av_freep(&video_codec_name);
-    av_freep(&audio_codec_name);
-    av_freep(&subtitle_codec_name);
-    av_freep(&input_filename);
-    avformat_network_deinit();
+        av_freep(&vfilters_list[i]); // 释放每个滤镜字符串（av_freep避免悬空指针）
+    av_freep(&vfilters_list);        // 释放滤镜列表数组
+
+    // 7. 释放编解码器名称参数
+    av_freep(&video_codec_name);    // 释放视频编解码器名称字符串
+    av_freep(&audio_codec_name);    // 释放音频编解码器名称字符串
+    av_freep(&subtitle_codec_name); // 释放字幕编解码器名称字符串
+
+    // 8. 释放输入文件名
+    av_freep(&input_filename); // 释放媒体文件路径字符串
+
+    // 9. 反初始化网络模块（如HTTP、RTMP协议）
+    avformat_network_deinit(); // 清理FFmpeg网络库的全局资源（若之前调用过avformat_network_init）
+
+    // 10. 控制台状态显示处理
     if (show_status)
-        printf("\n");
-    SDL_Quit();
-    av_log(NULL, AV_LOG_QUIET, "%s", "");
-    exit(0);
+        printf("\n"); // 若启用了状态显示，打印换行符以美化输出（如进度条结束）
+
+    // 11. 关闭SDL子系统
+    SDL_Quit(); // 销毁所有SDL模块（音频、视频、事件等），必须调用以避免资源泄漏
+
+    // 12. 静默FFmpeg日志输出
+    av_log(NULL, AV_LOG_QUIET, "%s", ""); // 设置日志级别为QUIET，抑制退出时的无关日志
+
+    // 13. 终止进程
+    exit(0); // 立即退出程序，返回状态码0（正常退出）
 }
 
 static void sigterm_handler(int sig)
