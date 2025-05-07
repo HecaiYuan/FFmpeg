@@ -462,7 +462,7 @@ static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
         av_packet_unref(pkt);
         return -1;
     }
-    av_packet_move_ref(pkt1, pkt); // 零拷贝优化 转移引用计数，避免数据拷贝，适用于高频数据流场 
+    av_packet_move_ref(pkt1, pkt); // 零拷贝优化 转移引用计数，避免数据拷贝，适用于高频数据流场
 
     SDL_LockMutex(q->mutex);
     ret = packet_queue_put_private(q, pkt1);
@@ -843,7 +843,7 @@ static Frame *frame_queue_peek_next(FrameQueue *f)
     return &f->queue[(f->rindex + f->rindex_shown + 1) % f->max_size];
 }
 
-// 获取最新的有效可用帧(队尾的帧)， 优先显示，确保最低延迟。
+// 当前已显示,渲染的最新帧, 优先显示，确保最低延迟。
 static Frame *frame_queue_peek_last(FrameQueue *f)
 {
     return &f->queue[f->rindex];
@@ -1591,21 +1591,65 @@ static void do_exit(VideoState *is)
     exit(0); // 立即退出程序，返回状态码0（正常退出）
 }
 
+/* SIGTERM 信号处理函数
+ * - sig : 接收到的信号编号（虽未使用但保留参数以符合信号处理函数原型）
+ * 功能：当进程收到 SIGTERM 信号时，以状态码 123 退出程序
+ * 特性：
+ *   1. static 限定符 - 限制函数作用域仅在当前编译单元可见
+ *   2. 直接退出 - 适用于需要快速终止的场景，不执行额外清理
+ *   3. 非标准退出码 - 123 可用于标识特定退出原因
+ * 典型应用场景：
+ *   - 容器化环境（如 Docker）发送 SIGTERM 时优雅退出
+ *   - 进程监控系统发送终止指令后记录特殊状态
+ * 注意事项：
+ *   - 信号处理函数中应避免复杂操作（如 malloc 等非异步安全函数）
+ *   - 若需要资源清理，应在调用 exit() 前完成
+ */
 static void sigterm_handler(int sig)
 {
-    exit(123);
+    exit(123); // 立即终止进程，返回状态码 123 给父进程
 }
 
+/**
+ * 设置默认窗口尺寸（考虑屏幕约束和像素宽高比）
+ *
+ * @param width   原始内容宽度（像素）
+ * @param height  原始内容高度（像素）
+ * @param sar     像素宽高比（AVRational结构体，sar = 宽/高）
+ *
+ * 处理逻辑：
+ * 1. 确定最大允许尺寸：优先使用全局设定的屏幕尺寸，无限制时使用INT_MAX
+ * 2. 当屏幕尺寸完全无约束时，将最大高度设为原始高度作为参考基准
+ * 3. 通过像素宽高比计算实际显示区域（自动适应屏幕约束）
+ * 4. 将计算结果设为默认窗口尺寸
+ *
+ * 特性：
+ * - static 限制函数作用域，属于模块内部实现
+ * - 依赖全局变量 screen_width/screen_height 获取屏幕约束
+ * - 调用 calculate_display_rect 实现核心布局计算
+ */
 static void set_default_window_size(int width, int height, AVRational sar)
 {
     SDL_Rect rect;
+
+    // 获取屏幕最大尺寸约束（未配置时使用INT_MAX表示无限制）
     int max_width  = screen_width  ? screen_width  : INT_MAX;
     int max_height = screen_height ? screen_height : INT_MAX;
+
+    // 特殊处理：当屏幕尺寸完全无约束时，使用原始高度作为参考基准
     if (max_width == INT_MAX && max_height == INT_MAX)
-        max_height = height;
-    calculate_display_rect(&rect, 0, 0, max_width, max_height, width, height, sar);
-    default_width  = rect.w;
-    default_height = rect.h;
+        max_height = height; // 避免两个维度都无限大导致布局计算异常
+
+    // 计算符合宽高比且适配屏幕约束的显示区域
+    calculate_display_rect(&rect,
+        0, 0,            // 显示位置起始坐标（左上角）
+        max_width, max_height,  // 最大允许尺寸
+        width, height,    // 原始内容尺寸
+        sar);             // 像素宽高比
+
+    // 设置默认窗口尺寸
+    default_width  = rect.w;  // 计算后的显示宽度
+    default_height = rect.h;  // 计算后的显示高度
 }
 
 static int video_open(VideoState *is)
@@ -1637,7 +1681,7 @@ static void video_display(VideoState *is)
     if (!is->width)
         video_open(is);
 
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); // 绘制颜色为黑色
     SDL_RenderClear(renderer);
     if (is->audio_st && is->show_mode != SHOW_MODE_VIDEO)
         video_audio_display(is);
@@ -1646,51 +1690,116 @@ static void video_display(VideoState *is)
     SDL_RenderPresent(renderer);
 }
 
-static double get_clock(Clock *c)
-{
+/* 时钟结构体定义（推测） */
+typedef struct Clock {
+    double pts;          // 当前显示时间戳（Presentation Timestamp）
+    double pts_drift;    // PTS与系统时间的差值（用于速度调整）
+    double last_updated; // 最后一次更新时间（秒为单位）
+    int *queue_serial;   // 指向数据包队列序列号的指针（用于同步校验）
+    int serial;          // 当前时钟的序列号
+    double speed;        // 播放速度（1.0=正常，2.0=2倍速）
+    int paused;          // 暂停状态（1=暂停，0=运行）
+} Clock;
+
+/**
+ * 获取时钟当前时间（考虑速度和暂停状态）
+ * @param c Clock指针
+ * @return 有效时返回当前时间（秒），否则返回NAN（表示不同步或无效）
+ */
+static double get_clock(Clock *c) {
+    /* 检查序列号是否匹配（确保操作的是最新数据） */
     if (*c->queue_serial != c->serial)
-        return NAN;
+        return NAN; // 数据队列已更新，当前时钟数据已过期
+
+    /* 暂停状态直接返回最后记录的PTS */
     if (c->paused) {
         return c->pts;
     } else {
+        /* 计算时间漂移后的实际时间：
+         * 1. 获取当前相对时间（微秒转秒）
+         * 2. 计算公式：c->pts_drift + time - (time - last_updated) * (1.0 - speed)
+         *    等效于：last_pts + (current_time - last_updated) * speed
+         *    实现变速播放时的时间线性插值
+         */
         double time = av_gettime_relative() / 1000000.0;
         return c->pts_drift + time - (time - c->last_updated) * (1.0 - c->speed);
     }
 }
 
-static void set_clock_at(Clock *c, double pts, int serial, double time)
-{
-    c->pts = pts;
-    c->last_updated = time;
-    c->pts_drift = c->pts - time;
-    c->serial = serial;
+/**
+ * 在指定时间点设置时钟参数（内部函数）
+ * @param c      Clock指针
+ * @param pts    新的显示时间戳
+ * @param serial 新序列号
+ * @param time   设置时间点（系统时间，秒为单位） 存储的是系统绝对时间
+ */
+static void set_clock_at(Clock *c, double pts, int serial, double time) {
+    c->pts = pts;                   // 记录原始PTS
+    c->last_updated = time;         // 更新最后操作时间戳
+    c->pts_drift = c->pts - time;   // 计算PTS与系统时间的初始差值
+    c->serial = serial;             // 更新序列号（标识数据版本）
 }
 
-static void set_clock(Clock *c, double pts, int serial)
-{
-    double time = av_gettime_relative() / 1000000.0;
+/**
+ * 在当前时间设置时钟参数（外部接口）
+ * @param c      Clock指针
+ * @param pts    新的显示时间戳
+ * @param serial 新序列号
+ */
+static void set_clock(Clock *c, double pts, int serial) {
+    // 获取当前系统时间（秒级精度）并调用内部函数 系统启动或程序运行时间
+    double time = av_gettime_relative() / 1000000.0; // 系统启动或程序运行时间
     set_clock_at(c, pts, serial, time);
 }
 
-static void set_clock_speed(Clock *c, double speed)
-{
-    set_clock(c, get_clock(c), c->serial);
-    c->speed = speed;
+/**
+ * 调整时钟播放速度
+ * @param c     Clock指针
+ * @param speed 新速度值（必须>0）
+ */
+static void set_clock_speed(Clock *c, double speed) {
+    /* 关键操作：
+     * 1. 基于当前速度重新计算时钟参数
+     * 2. 更新速度值（避免跳跃式变化）
+     */
+    set_clock(c, get_clock(c), c->serial); // 用当前时间重新锚定
+    c->speed = speed;                      // 应用新速度
 }
 
-static void init_clock(Clock *c, int *queue_serial)
-{
-    c->speed = 1.0;
-    c->paused = 0;
-    c->queue_serial = queue_serial;
-    set_clock(c, NAN, -1);
+/**
+ * 初始化时钟结构体
+ * @param c             Clock指针
+ * @param queue_serial  关联的数据包队列序列号指针
+ */
+static void init_clock(Clock *c, int *queue_serial) {
+    c->speed = 1.0;             // 默认正常速度
+    c->paused = 0;              // 初始非暂停状态
+    c->queue_serial = queue_serial; // 绑定队列序列号
+    set_clock(c, NAN, -1);      // 初始化为无效状态（时间=NAN，序列号=-1）
 }
 
+/**
+ * 将主时钟同步到从时钟
+ *
+ * 当从时钟有效且满足以下任一条件时，强制将主时钟设置为从时钟的值：
+ * 1. 主时钟当前无效（NaN）
+ * 2. 主从时钟差值超过同步阈值（NOSYNC_THRESHOLD）
+ *
+ * @param c     主时钟（需要被同步的时钟）
+ * @param slave 从时钟（作为参考源的时钟）
+ */
 static void sync_clock_to_slave(Clock *c, Clock *slave)
 {
+    // 获取主时钟当前值
     double clock = get_clock(c);
+    // 获取从时钟当前值
     double slave_clock = get_clock(slave);
+
+    // 同步条件：
+    // 1. 从时钟值有效（非NaN）
+    // 2. 且（主时钟无效 或 主从时钟差值超过阈值）
     if (!isnan(slave_clock) && (isnan(clock) || fabs(clock - slave_clock) > AV_NOSYNC_THRESHOLD))
+        // 强制将主时钟设置为从时钟的值，并继承从时钟的序列号
         set_clock(c, slave_clock, slave->serial);
 }
 
@@ -1729,120 +1838,230 @@ static double get_master_clock(VideoState *is)
     return val;
 }
 
+// 播放器核心的同步控制机制，通过动态调整时钟速度，在保证流畅播放的前提下，
+// 最大限度维持音视频同步和实时性 通过缓冲区状态反馈实现自适应速率控制
 static void check_external_clock_speed(VideoState *is) {
+   // 情况1：缓冲区不足时降速
    if (is->video_stream >= 0 && is->videoq.nb_packets <= EXTERNAL_CLOCK_MIN_FRAMES ||
        is->audio_stream >= 0 && is->audioq.nb_packets <= EXTERNAL_CLOCK_MIN_FRAMES) {
-       set_clock_speed(&is->extclk, FFMAX(EXTERNAL_CLOCK_SPEED_MIN, is->extclk.speed - EXTERNAL_CLOCK_SPEED_STEP));
-   } else if ((is->video_stream < 0 || is->videoq.nb_packets > EXTERNAL_CLOCK_MAX_FRAMES) &&
-              (is->audio_stream < 0 || is->audioq.nb_packets > EXTERNAL_CLOCK_MAX_FRAMES)) {
-       set_clock_speed(&is->extclk, FFMIN(EXTERNAL_CLOCK_SPEED_MAX, is->extclk.speed + EXTERNAL_CLOCK_SPEED_STEP));
-   } else {
+       // 计算新速度 = max(最小速度, 当前速度-步长)
+       set_clock_speed(&is->extclk, FFMAX(EXTERNAL_CLOCK_SPEED_MIN,
+                                         is->extclk.speed - EXTERNAL_CLOCK_SPEED_STEP));
+   }
+
+   // 情况2：缓冲区充足时加速
+   else if ((is->video_stream < 0 || is->videoq.nb_packets > EXTERNAL_CLOCK_MAX_FRAMES) &&
+            (is->audio_stream < 0 || is->audioq.nb_packets > EXTERNAL_CLOCK_MAX_FRAMES)) {
+       // 计算新速度 = min(最大速度, 当前速度+步长)
+       set_clock_speed(&is->extclk, FFMIN(EXTERNAL_CLOCK_SPEED_MAX,
+                                         is->extclk.speed + EXTERNAL_CLOCK_SPEED_STEP));
+   }
+
+   // 情况3：缓冲区正常时向基准速度回归
+   else {
        double speed = is->extclk.speed;
-       if (speed != 1.0)
-           set_clock_speed(&is->extclk, speed + EXTERNAL_CLOCK_SPEED_STEP * (1.0 - speed) / fabs(1.0 - speed));
+       if (speed != 1.0) {
+           // 智能回归公式：根据当前速度与1.0的差距方向调整
+           set_clock_speed(&is->extclk,
+                          speed + EXTERNAL_CLOCK_SPEED_STEP *
+                          (1.0 - speed) / fabs(1.0 - speed));
+       }
    }
 }
 
 /* seek in the stream */
 static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int by_bytes)
 {
+    // 检查是否已有未处理的跳转请求
     if (!is->seek_req) {
+        // 设置跳转目标位置（绝对位置）
         is->seek_pos = pos;
-        is->seek_rel = rel;
-        is->seek_flags &= ~AVSEEK_FLAG_BYTE;
+
+        // 设置相对偏移量（相对于pos的偏移）
+        is->seek_rel = rel;  // 实际跳转位置=pos+rel
+
+        // 清除字节跳转标志（准备重新设置）
+        is->seek_flags &= ~AVSEEK_FLAG_BYTE; // 还有向后寻找关键帧的方式 AVSEEK_FLAG_BACKWARD
+
+        // 如果要求按字节跳转，设置相应标志位
         if (by_bytes)
             is->seek_flags |= AVSEEK_FLAG_BYTE;
+
+        // 设置跳转请求标志（通知后台线程）
         is->seek_req = 1;
+
+        // 唤醒阻塞的读取线程
         SDL_CondSignal(is->continue_read_thread);
     }
 }
 
-/* pause or resume the video */
+/* 暂停或恢复视频播放 */
 static void stream_toggle_pause(VideoState *is)
 {
+    // 如果当前处于暂停状态（即将恢复播放）
     if (is->paused) {
+        // 更新帧定时器：补偿暂停期间的时间差
         is->frame_timer += av_gettime_relative() / 1000000.0 - is->vidclk.last_updated;
+
+        // 特殊处理：非系统级暂停时恢复视频时钟
         if (is->read_pause_return != AVERROR(ENOSYS)) {
             is->vidclk.paused = 0;
         }
+
+        // 更新视频时钟为当前值（保持连续性）
         set_clock(&is->vidclk, get_clock(&is->vidclk), is->vidclk.serial);
     }
+
+    // 更新外部时钟为当前值
     set_clock(&is->extclk, get_clock(&is->extclk), is->extclk.serial);
+
+    // 切换所有时钟的暂停状态
     is->paused = is->audclk.paused = is->vidclk.paused = is->extclk.paused = !is->paused;
 }
 
+/* 切换暂停状态（外部接口） */
 static void toggle_pause(VideoState *is)
 {
+    // 调用核心暂停/恢复逻辑
     stream_toggle_pause(is);
+
+    // 重置单帧步进标志
     is->step = 0;
 }
 
+/* 切换静音状态 */
+// 单行实现状态翻转
+// 实际静音操作在音频播放线程处理
 static void toggle_mute(VideoState *is)
 {
+    // 翻转静音状态标志
     is->muted = !is->muted;
 }
 
+/* 更新音频音量 */
 static void update_volume(VideoState *is, int sign, double step)
 {
-    double volume_level = is->audio_volume ? (20 * log(is->audio_volume / (double)SDL_MIX_MAXVOLUME) / log(10)) : -1000.0;
+    // 1. 计算当前音量对应的分贝值
+    double volume_level = is->audio_volume ?
+        (20 * log(is->audio_volume / (double)SDL_MIX_MAXVOLUME) / log(10)) :
+        -1000.0;
+
+    // 2. 计算新的线性音量值
     int new_volume = lrint(SDL_MIX_MAXVOLUME * pow(10.0, (volume_level + sign * step) / 20.0));
-    is->audio_volume = av_clip(is->audio_volume == new_volume ? (is->audio_volume + sign) : new_volume, 0, SDL_MIX_MAXVOLUME);
+
+    // 3. 应用并裁剪音量值
+    is->audio_volume = av_clip(
+        is->audio_volume == new_volume ?
+            (is->audio_volume + sign) :  // 特殊处理：防止卡在相同值
+            new_volume,
+        0,
+        SDL_MIX_MAXVOLUME
+    );
 }
 
+/* 步进到下一帧 */
 static void step_to_next_frame(VideoState *is)
 {
-    /* if the stream is paused unpause it, then step */
+    // 如果当前处于暂停状态，则先解除暂停
     if (is->paused)
         stream_toggle_pause(is);
+
+    // 设置单帧步进标志
     is->step = 1;
 }
 
+/**
+ * 计算目标视频帧延迟时间
+ * @param delay 当前视频帧的原始延迟时间（单位：秒）
+ * @param is    视频状态对象指针
+ * @return      调整后的目标延迟时间
+ */
 static double compute_target_delay(double delay, VideoState *is)
 {
     double sync_threshold, diff = 0;
 
-    /* update delay to follow master synchronisation source */
+    /* 如果视频不是主同步源（即视频作为从属同步源） */
     if (get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER) {
-        /* if video is slave, we try to correct big delays by
-           duplicating or deleting a frame */
+        /* 计算视频时钟与主时钟的差值（视频落后主时钟时diff为正） 视频时间与音频时间的差值*/
         diff = get_clock(&is->vidclk) - get_master_clock(is);
 
-        /* skip or repeat frame. We take into account the
-           delay to compute the threshold. I still don't know
-           if it is the best guess */
-        sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN, FFMIN(AV_SYNC_THRESHOLD_MAX, delay));
+        /* 动态计算同步阈值：
+         * - 确保阈值在AV_SYNC_THRESHOLD_MIN和AV_SYNC_THRESHOLD_MAX之间
+         * - 同时考虑当前帧延迟delay作为参考值
+         */
+        sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN,
+                              FFMIN(AV_SYNC_THRESHOLD_MAX, delay));
+
+        /* 仅当差值有效且小于最大帧持续时间时才进行调整 */
         if (!isnan(diff) && fabs(diff) < is->max_frame_duration) {
-            if (diff <= -sync_threshold)
+            /* 情况1：视频落后超过阈值（diff为负） */
+            if (diff <= -sync_threshold) {
+                // 减少延迟：当前延迟 + 负差值（相当于减少延迟值）
                 delay = FFMAX(0, delay + diff);
-            else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD)
+            }
+            /* 情况2：视频超前超过阈值且当前延迟较大 */
+            else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD) {
+                // 直接增加延迟补偿差值
                 delay = delay + diff;
-            else if (diff >= sync_threshold)
+            }
+            /* 情况3：视频超前超过阈值但当前延迟较小 */
+            else if (diff >= sync_threshold) {
+                // 安全策略：将延迟加倍（避免过度跳帧）
                 delay = 2 * delay;
+            }
         }
     }
 
-    av_log(NULL, AV_LOG_TRACE, "video: delay=%0.3f A-V=%f\n",
-            delay, -diff);
+    /* 记录跟踪日志：显示最终延迟和音视频差值 */
+    av_log(NULL, AV_LOG_TRACE, "video: delay=%0.3f A-V=%f\n", delay, -diff);
 
     return delay;
 }
 
+/**
+ * 计算两个连续视频帧之间的有效持续时间
+ *
+ * @param is     视频状态管理器（包含全局播放信息）
+ * @param vp     当前视频帧
+ * @param nextvp 下一视频帧
+ * @return       计算得到的帧间持续时间（秒）
+ */
 static double vp_duration(VideoState *is, Frame *vp, Frame *nextvp) {
+    // 检查两帧是否属于同一个解码序列（serial变化说明发生了seek或流切换）
     if (vp->serial == nextvp->serial) {
+        // 基于时间戳计算理论持续时间：下一帧PTS - 当前帧PTS
         double duration = nextvp->pts - vp->pts;
+
+        /* 有效性检查（三重保护）：
+         * 1. isnan(duration)   -> 时间戳值异常（非数字）
+         * 2. duration <= 0      -> 时间戳不递增（错误或B帧乱序）
+         * 3. duration > max_frame_duration -> 超过阈值（异常大间隔）
+         */
         if (isnan(duration) || duration <= 0 || duration > is->max_frame_duration)
+            // 使用当前帧自带的默认持续时间（通常基于帧率计算）
             return vp->duration;
         else
+            // 返回计算出的有效时间间隔
             return duration;
     } else {
+        // 序列号不匹配（如seek后），返回0表示非连续帧
         return 0.0;
     }
 }
 
+/**
+ * 更新视频时钟系统
+ * 
+ * @param is     视频状态管理器（包含时钟系统）
+ * @param pts    新视频帧的显示时间戳（单位：秒）
+ * @param serial 当前帧的序列号（用于seek检测）
+ */
 static void update_video_pts(VideoState *is, double pts, int serial)
 {
-    /* update current video pts */
+    /* 更新主视频时钟 */
     set_clock(&is->vidclk, pts, serial);
+    
+    /* 将外部参考时钟同步到视频时钟 */
     sync_clock_to_slave(&is->extclk, &is->vidclk);
 }
 
@@ -1854,15 +2073,20 @@ static void video_refresh(void *opaque, double *remaining_time)
 
     Frame *sp, *sp2;
 
+    // is->realtime 实时播放模式
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
 
+    // 非视频模式 仅显示音频
     if (!display_disable && is->show_mode != SHOW_MODE_VIDEO && is->audio_st) {
         time = av_gettime_relative() / 1000000.0;
+        // 强制刷新标志(外部事件)触发立即渲染 和距离上次刷新已超过设定间隔
+        // is->last_vis_time 记录了上次渲染的时间 rdftspeed 音频可视化的刷新速度
         if (is->force_refresh || is->last_vis_time + rdftspeed < time) {
             video_display(is);
             is->last_vis_time = time;
         }
+        // 动态计算下次刷新的剩余时间
         *remaining_time = FFMIN(*remaining_time, is->last_vis_time + rdftspeed - time);
     }
 
@@ -1875,6 +2099,7 @@ retry:
             Frame *vp, *lastvp;
 
             /* dequeue the picture */
+            // 获取队列中已经显示的帧和当前帧
             lastvp = frame_queue_peek_last(&is->pictq);
             vp = frame_queue_peek(&is->pictq);
 
@@ -1883,15 +2108,21 @@ retry:
                 goto retry;
             }
 
+            // 序列变化时重置帧计时器
             if (lastvp->serial != vp->serial)
+                // PTS 帧在媒体时间轴（Media Timeline）上应该被显示的时刻
+                // 记录当前帧在系统时间轴（Real-Time Clock）上的理论播放时刻
+                // Seek操作 帧渲染调度 暂停恢复
                 is->frame_timer = av_gettime_relative() / 1000000.0;
 
             if (is->paused)
                 goto display;
 
+            // === 帧同步计算 ===
+            // 1. 计算上一帧的持续时间
             /* compute nominal last_duration */
             last_duration = vp_duration(is, lastvp, vp);
-            delay = compute_target_delay(last_duration, is);
+            delay = compute_target_delay(last_duration, is); // 经音视频同步修正后的实际渲染延迟
 
             time= av_gettime_relative()/1000000.0;
             if (time < is->frame_timer + delay) {
