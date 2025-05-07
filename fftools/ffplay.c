@@ -1591,21 +1591,65 @@ static void do_exit(VideoState *is)
     exit(0); // 立即退出程序，返回状态码0（正常退出）
 }
 
+/* SIGTERM 信号处理函数
+ * - sig : 接收到的信号编号（虽未使用但保留参数以符合信号处理函数原型）
+ * 功能：当进程收到 SIGTERM 信号时，以状态码 123 退出程序
+ * 特性：
+ *   1. static 限定符 - 限制函数作用域仅在当前编译单元可见
+ *   2. 直接退出 - 适用于需要快速终止的场景，不执行额外清理
+ *   3. 非标准退出码 - 123 可用于标识特定退出原因
+ * 典型应用场景：
+ *   - 容器化环境（如 Docker）发送 SIGTERM 时优雅退出
+ *   - 进程监控系统发送终止指令后记录特殊状态
+ * 注意事项：
+ *   - 信号处理函数中应避免复杂操作（如 malloc 等非异步安全函数）
+ *   - 若需要资源清理，应在调用 exit() 前完成
+ */
 static void sigterm_handler(int sig)
 {
-    exit(123);
+    exit(123); // 立即终止进程，返回状态码 123 给父进程
 }
 
+/**
+ * 设置默认窗口尺寸（考虑屏幕约束和像素宽高比）
+ * 
+ * @param width   原始内容宽度（像素）
+ * @param height  原始内容高度（像素）
+ * @param sar     像素宽高比（AVRational结构体，sar = 宽/高）
+ * 
+ * 处理逻辑：
+ * 1. 确定最大允许尺寸：优先使用全局设定的屏幕尺寸，无限制时使用INT_MAX
+ * 2. 当屏幕尺寸完全无约束时，将最大高度设为原始高度作为参考基准
+ * 3. 通过像素宽高比计算实际显示区域（自动适应屏幕约束）
+ * 4. 将计算结果设为默认窗口尺寸
+ * 
+ * 特性：
+ * - static 限制函数作用域，属于模块内部实现
+ * - 依赖全局变量 screen_width/screen_height 获取屏幕约束
+ * - 调用 calculate_display_rect 实现核心布局计算
+ */
 static void set_default_window_size(int width, int height, AVRational sar)
 {
     SDL_Rect rect;
+    
+    // 获取屏幕最大尺寸约束（未配置时使用INT_MAX表示无限制）
     int max_width  = screen_width  ? screen_width  : INT_MAX;
     int max_height = screen_height ? screen_height : INT_MAX;
+    
+    // 特殊处理：当屏幕尺寸完全无约束时，使用原始高度作为参考基准
     if (max_width == INT_MAX && max_height == INT_MAX)
-        max_height = height;
-    calculate_display_rect(&rect, 0, 0, max_width, max_height, width, height, sar);
-    default_width  = rect.w;
-    default_height = rect.h;
+        max_height = height; // 避免两个维度都无限大导致布局计算异常
+    
+    // 计算符合宽高比且适配屏幕约束的显示区域
+    calculate_display_rect(&rect, 
+        0, 0,            // 显示位置起始坐标（左上角）
+        max_width, max_height,  // 最大允许尺寸
+        width, height,    // 原始内容尺寸
+        sar);             // 像素宽高比
+    
+    // 设置默认窗口尺寸
+    default_width  = rect.w;  // 计算后的显示宽度
+    default_height = rect.h;  // 计算后的显示高度
 }
 
 static int video_open(VideoState *is)
