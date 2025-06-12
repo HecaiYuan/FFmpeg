@@ -283,7 +283,7 @@ typedef struct VideoState {
     AVStream *subtitle_st;
     PacketQueue subtitleq;
 
-    double frame_timer; // 帧定时器
+    double frame_timer; // 帧定时器 下一帧应该显示的时间点 是累计时间
     double frame_last_returned_time; // 上一帧的显示时间戳
     double frame_last_filter_delay; // 上一帧的滤镜延迟
     int video_stream;
@@ -837,7 +837,7 @@ static Frame *frame_queue_peek(FrameQueue *f)
     return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
 }
 
-// 预取下一个可读帧(队头后一帧)，作用:提前分析后续帧的问题，实现帧间差值计算或缓冲状态预判
+// 预取下一个可读帧，作用:提前分析后续帧的问题，实现帧间差值计算或缓冲状态预判
 static Frame *frame_queue_peek_next(FrameQueue *f)
 {
     return &f->queue[(f->rindex + f->rindex_shown + 1) % f->max_size];
@@ -2051,7 +2051,7 @@ static double vp_duration(VideoState *is, Frame *vp, Frame *nextvp) {
 
 /**
  * 更新视频时钟系统
- * 
+ *
  * @param is     视频状态管理器（包含时钟系统）
  * @param pts    新视频帧的显示时间戳（单位：秒）
  * @param serial 当前帧的序列号（用于seek检测）
@@ -2060,7 +2060,7 @@ static void update_video_pts(VideoState *is, double pts, int serial)
 {
     /* 更新主视频时钟 */
     set_clock(&is->vidclk, pts, serial);
-    
+
     /* 将外部参考时钟同步到视频时钟 */
     sync_clock_to_slave(&is->extclk, &is->vidclk);
 }
@@ -2125,190 +2125,250 @@ retry:
             delay = compute_target_delay(last_duration, is); // 经音视频同步修正后的实际渲染延迟
 
             time= av_gettime_relative()/1000000.0;
-            if (time < is->frame_timer + delay) {
+            if (time < is->frame_timer + delay) { // 未到达显示时间
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
                 goto display;
             }
 
-            is->frame_timer += delay;
+            is->frame_timer += delay; // delay过大 则重置计时器显示时间
             if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
                 is->frame_timer = time;
 
+            // 更新视频时钟
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
                 update_video_pts(is, vp->pts, vp->serial);
             SDL_UnlockMutex(is->pictq.mutex);
 
             if (frame_queue_nb_remaining(&is->pictq) > 1) {
+                // 获取下一帧的指针（不移动队列指针
                 Frame *nextvp = frame_queue_peek_next(&is->pictq);
+                // 计算当前帧vp的理论显示时长（基于PTS差值
                 duration = vp_duration(is, vp, nextvp);
+                // 丢帧条件：非单步模式 强制丢帧 系统时间超过当前帧应结束的时刻
                 if(!is->step && (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) && time > is->frame_timer + duration){
-                    is->frame_drops_late++;
-                    frame_queue_next(&is->pictq);
-                    goto retry;
+                    is->frame_drops_late++;  // 统计延迟丢帧次数
+                    frame_queue_next(&is->pictq);  // 将当前帧移出队列
+                    goto retry;  // 重新尝试处理下一帧
                 }
             }
 
+            // 检查是否存在字幕流
             if (is->subtitle_st) {
+                // 遍历字幕帧队列（不移动队列指针）
                 while (frame_queue_nb_remaining(&is->subpq) > 0) {
+                    // 获取当前队首字幕帧（peek操作不移动指针）
                     sp = frame_queue_peek(&is->subpq);
 
+                    // 检查队列中是否至少存在2帧字幕
                     if (frame_queue_nb_remaining(&is->subpq) > 1)
-                        sp2 = frame_queue_peek_next(&is->subpq);
+                        sp2 = frame_queue_peek_next(&is->subpq);  // 获取下一帧（用于预判显示时间）
                     else
                         sp2 = NULL;
 
+                    /* 判断是否应丢弃当前字幕帧的条件：
+                       1. 序列号不匹配（说明字幕流已重置）
+                       2. 视频时钟超过当前字幕结束时间（sp->pts + end_display_time/1000）
+                       3. 视频时钟超过下一字幕开始时间（预判丢弃当前帧以避免重叠）*/
                     if (sp->serial != is->subtitleq.serial
                             || (is->vidclk.pts > (sp->pts + ((float) sp->sub.end_display_time / 1000)))
                             || (sp2 && is->vidclk.pts > (sp2->pts + ((float) sp2->sub.start_display_time / 1000))))
                     {
+                        // 如果字幕已上传到纹理（需清理显存）,避免残留渲染
                         if (sp->uploaded) {
-                            int i;
+                            // 遍历字幕的所有矩形区域
                             for (i = 0; i < sp->sub.num_rects; i++) {
                                 AVSubtitleRect *sub_rect = sp->sub.rects[i];
                                 uint8_t *pixels;
                                 int pitch, j;
 
+                                // 锁定SDL纹理并清空像素数据（透明化处理）
                                 if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)&pixels, &pitch)) {
                                     for (j = 0; j < sub_rect->h; j++, pixels += pitch)
-                                        memset(pixels, 0, sub_rect->w << 2);
+                                        memset(pixels, 0, sub_rect->w << 2);  // ARGB清0（透明色）
                                     SDL_UnlockTexture(is->sub_texture);
                                 }
                             }
                         }
-                        frame_queue_next(&is->subpq);
+                        frame_queue_next(&is->subpq);  // 正式移出当前帧
                     } else {
-                        break;
+                        break;  // 当前帧未过期，终止清理循环
                     }
                 }
             }
 
             frame_queue_next(&is->pictq);
-            is->force_refresh = 1;
+            is->force_refresh = 1; // 强制标记需要立即刷新视频画面，触发SDL渲染器重新绘制
+            // 帧丢弃后需要快速显示下一帧 用户交互（如暂停/播放/跳转）后的画面更新
 
             if (is->step && !is->paused)
-                stream_toggle_pause(is);
+                stream_toggle_pause(is); /* 暂停或恢复视频播放 */
         }
 display:
         /* display picture */
         if (!display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown)
             video_display(is);
     }
-    is->force_refresh = 0;
-    if (show_status) {
-        AVBPrint buf;
-        static int64_t last_time;
-        int64_t cur_time;
-        int aqsize, vqsize, sqsize;
-        double av_diff;
+    // 周期性打印播放状态信息
+    is->force_refresh = 0;  // 重置强制刷新标志
 
+    if (show_status) {      // 检查是否需要显示状态信息
+        AVBPrint buf;       // FFmpeg的动态字符串缓冲区
+        static int64_t last_time; // 上次刷新时间（静态变量保持状态）
+        int64_t cur_time;   // 当前时间
+        int aqsize, vqsize, sqsize; // 音频/视频/字幕队列大小
+        double av_diff;     // 音视频时钟差值
+
+        // 获取当前相对时间（微秒）
         cur_time = av_gettime_relative();
+
+        // 每30毫秒刷新一次状态（或首次刷新）
         if (!last_time || (cur_time - last_time) >= 30000) {
+            // 初始化队列大小
             aqsize = 0;
             vqsize = 0;
             sqsize = 0;
-            if (is->audio_st)
-                aqsize = is->audioq.size;
-            if (is->video_st)
-                vqsize = is->videoq.size;
-            if (is->subtitle_st)
-                sqsize = is->subtitleq.size;
+
+            // 获取各队列的实际大小
+            if (is->audio_st) aqsize = is->audioq.size;
+            if (is->video_st) vqsize = is->videoq.size;
+            if (is->subtitle_st) sqsize = is->subtitleq.size;
+
+            // 计算时钟差值：
             av_diff = 0;
+            // 情况1：同时存在音频和视频流 → 计算音频时钟-视频时钟
             if (is->audio_st && is->video_st)
                 av_diff = get_clock(&is->audclk) - get_clock(&is->vidclk);
+            // 情况2：只有视频流 → 主时钟-视频时钟
             else if (is->video_st)
                 av_diff = get_master_clock(is) - get_clock(&is->vidclk);
+            // 情况3：只有音频流 → 主时钟-音频时钟
             else if (is->audio_st)
                 av_diff = get_master_clock(is) - get_clock(&is->audclk);
 
+            // 初始化动态字符串缓冲区
             av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
+
+            // 格式化状态行（使用回车符\r实现原地刷新）：
             av_bprintf(&buf,
                       "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB \r",
-                      get_master_clock(is),
-                      (is->audio_st && is->video_st) ? "A-V" : (is->video_st ? "M-V" : (is->audio_st ? "M-A" : "   ")),
-                      av_diff,
-                      is->frame_drops_early + is->frame_drops_late,
-                      aqsize / 1024,
-                      vqsize / 1024,
-                      sqsize);
+                      get_master_clock(is),  // 主时钟（播放位置，秒）
+                      // 状态标识：
+                      (is->audio_st && is->video_st) ? "A-V" :  // 音视频同步模式
+                      (is->video_st ? "M-V" :  // 纯视频模式
+                      (is->audio_st ? "M-A" :  // 纯音频模式
+                      "   ")),  // 无媒体流
+                      av_diff,  // 时钟差值
+                      is->frame_drops_early + is->frame_drops_late, // 总丢帧数
+                      aqsize / 1024,  // 音频队列大小(KB)
+                      vqsize / 1024,  // 视频队列大小(KB)
+                      sqsize);         // 字幕队列大小(字节)
 
+            // 选择输出方式：
             if (show_status == 1 && AV_LOG_INFO > av_log_get_level())
-                fprintf(stderr, "%s", buf.str);
+                fprintf(stderr, "%s", buf.str);  // 直接输出到stderr
             else
-                av_log(NULL, AV_LOG_INFO, "%s", buf.str);
+                av_log(NULL, AV_LOG_INFO, "%s", buf.str); // 通过FFmpeg日志系统输出
 
-            fflush(stderr);
-            av_bprint_finalize(&buf, NULL);
+            fflush(stderr);  // 强制刷新标准错误输出
+            av_bprint_finalize(&buf, NULL);  // 释放缓冲区
 
-            last_time = cur_time;
+            last_time = cur_time;  // 更新最后刷新时间
         }
     }
 }
 
+// 视频渲染管道的核心环节，连接解码线程与显示线程
+// 将解码后的视频帧加入图像队列
 static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double duration, int64_t pos, int serial)
 {
-    Frame *vp;
+    Frame *vp;  // 指向队列中可写帧的指针
 
+    // 调试信息：输出帧类型和显示时间戳
 #if defined(DEBUG_SYNC)
     printf("frame_type=%c pts=%0.3f\n",
            av_get_picture_type_char(src_frame->pict_type), pts);
 #endif
 
+    // 从图像队列获取一个可写帧位置（如果队列满则返回错误）
     if (!(vp = frame_queue_peek_writable(&is->pictq)))
         return -1;
 
+    // 设置帧的宽高比（Sample Aspect Ratio）
     vp->sar = src_frame->sample_aspect_ratio;
+
+    // 标记该帧尚未上传到显示设备（如GPU纹理）
     vp->uploaded = 0;
 
-    vp->width = src_frame->width;
-    vp->height = src_frame->height;
-    vp->format = src_frame->format;
+    // 设置帧的基本属性
+    vp->width = src_frame->width;    // 视频宽度
+    vp->height = src_frame->height;  // 视频高度
+    vp->format = src_frame->format;  // 像素格式（如YUV420P）
 
-    vp->pts = pts;
-    vp->duration = duration;
-    vp->pos = pos;
-    vp->serial = serial;
+    // 设置帧的时间信息
+    vp->pts = pts;         // 显示时间戳（Presentation Time Stamp）
+    vp->duration = duration; // 帧持续时间
+    vp->pos = pos;          // 在媒体文件中的字节位置
+    vp->serial = serial;    // 序列号（用于seek操作后识别新旧帧）
 
+    // 根据视频尺寸和宽高比设置默认窗口大小
     set_default_window_size(vp->width, vp->height, vp->sar);
 
+    // 将源帧数据转移到队列帧（避免复制，高效移动引用）
     av_frame_move_ref(vp->frame, src_frame);
+
+    // 将帧推入队列（更新队列状态）
     frame_queue_push(&is->pictq);
-    return 0;
+
+    return 0;  // 成功返回0
 }
 
+// 从视频解码器获取一帧视频
 static int get_video_frame(VideoState *is, AVFrame *frame)
 {
-    int got_picture;
+    int got_picture;  // 是否成功获取帧的标志
 
+    // 尝试从视频解码器解码一帧
     if ((got_picture = decoder_decode_frame(&is->viddec, frame, NULL)) < 0)
-        return -1;
+        return -1;  // 解码出错返回错误
 
+    // 如果成功获取到帧
     if (got_picture) {
-        double dpts = NAN;
+        double dpts = NAN;  // 初始化显示时间戳为NaN
 
+        // 如果帧有有效的PTS，转换为秒单位
         if (frame->pts != AV_NOPTS_VALUE)
             dpts = av_q2d(is->video_st->time_base) * frame->pts;
 
+        // 计算帧的宽高比（从容器/流/帧信息中推断）
         frame->sample_aspect_ratio = av_guess_sample_aspect_ratio(is->ic, is->video_st, frame);
 
-        if (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) {
+        /* 帧丢弃逻辑：当需要主动丢帧时 */
+        if (framedrop > 0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) {
+            // 只在有有效PTS时进行丢帧判断
             if (frame->pts != AV_NOPTS_VALUE) {
+                // 计算当前帧与主时钟的差值
                 double diff = dpts - get_master_clock(is);
-                if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD &&
-                    diff - is->frame_last_filter_delay < 0 &&
-                    is->viddec.pkt_serial == is->vidclk.serial &&
-                    is->videoq.nb_packets) {
-                    is->frame_drops_early++;
-                    av_frame_unref(frame);
-                    got_picture = 0;
+
+                /* 满足以下所有条件时丢弃当前帧： */
+                if (!isnan(diff) &&                // 1. 差值是有效数字
+                    fabs(diff) < AV_NOSYNC_THRESHOLD && // 2. 差值在同步阈值内（通常10秒）
+                    diff - is->frame_last_filter_delay < 0 && // 3. 帧已经过时（考虑滤镜延迟）
+                    is->viddec.pkt_serial == is->vidclk.serial && // 4. 序列号匹配（未发生seek）
+                    is->videoq.nb_packets)         // 5. 视频队列中还有后续帧
+                {
+                    is->frame_drops_early++;  // 增加早期丢帧计数
+                    av_frame_unref(frame);    // 释放当前帧
+                    got_picture = 0;          // 标记为未获取有效帧
                 }
             }
         }
     }
 
-    return got_picture;
+    return got_picture;  // 返回获取帧的状态
 }
 
+// FFmpeg 多媒体处理中用于配置滤镜图的核心函数。它负责连接源滤镜和接收滤镜，并根据需要解析自定义滤镜链
 static int configure_filtergraph(AVFilterGraph *graph, const char *filtergraph,
                                  AVFilterContext *source_ctx, AVFilterContext *sink_ctx)
 {
@@ -2570,82 +2630,113 @@ end:
     return ret;
 }
 
+// 这个函数是音频解码线程的核心实现，负责从音频流中解码数据、应用滤镜并将处理后的音频帧送入播放队列。
 static int audio_thread(void *arg)
 {
-    VideoState *is = arg;
-    AVFrame *frame = av_frame_alloc();
-    Frame *af;
-    int last_serial = -1;
-    int reconfigure;
-    int got_frame = 0;
-    AVRational tb;
-    int ret = 0;
+    VideoState *is = arg;          // 获取播放器状态对象
+    AVFrame *frame = av_frame_alloc(); // 分配帧对象用于存储解码后的音频
+    Frame *af;                     // 指向音频帧队列的帧
+    int last_serial = -1;          // 跟踪上一个包的序列号（用于检测seek操作）
+    int reconfigure;               // 是否需要重新配置滤镜的标志
+    int got_frame = 0;             // 是否成功解码帧的标志
+    AVRational tb;                 // 时间基（用于时间戳计算）
+    int ret = 0;                   // 函数返回值和错误码
 
+    // 内存分配检查
     if (!frame)
         return AVERROR(ENOMEM);
 
+    // 主解码循环
     do {
+        // 尝试从解码器获取音频帧
         if ((got_frame = decoder_decode_frame(&is->auddec, frame, NULL)) < 0)
-            goto the_end;
+            goto the_end;  // 解码失败则跳转到清理
 
-        if (got_frame) {
-                tb = (AVRational){1, frame->sample_rate};
+        if (got_frame) {  // 成功获取到音频帧
+            tb = (AVRational){1, frame->sample_rate};  // 设置时间基（基于采样率）
 
-                reconfigure =
-                    cmp_audio_fmts(is->audio_filter_src.fmt, is->audio_filter_src.ch_layout.nb_channels,
-                                   frame->format, frame->ch_layout.nb_channels)    ||
-                    av_channel_layout_compare(&is->audio_filter_src.ch_layout, &frame->ch_layout) ||
-                    is->audio_filter_src.freq           != frame->sample_rate ||
-                    is->auddec.pkt_serial               != last_serial;
+            /* 检查是否需要重新配置音频滤镜 */
+            reconfigure =
+                // 1. 格式变化检测：比较源格式和当前帧格式
+                cmp_audio_fmts(is->audio_filter_src.fmt, is->audio_filter_src.ch_layout.nb_channels,
+                               frame->format, frame->ch_layout.nb_channels) ||
+                // 2. 声道布局变化检测
+                av_channel_layout_compare(&is->audio_filter_src.ch_layout, &frame->ch_layout) ||
+                // 3. 采样率变化检测
+                is->audio_filter_src.freq != frame->sample_rate ||
+                // 4. 序列号变化检测（表示seek操作）
+                is->auddec.pkt_serial != last_serial;
 
-                if (reconfigure) {
-                    char buf1[1024], buf2[1024];
-                    av_channel_layout_describe(&is->audio_filter_src.ch_layout, buf1, sizeof(buf1));
-                    av_channel_layout_describe(&frame->ch_layout, buf2, sizeof(buf2));
-                    av_log(NULL, AV_LOG_DEBUG,
-                           "Audio frame changed from rate:%d ch:%d fmt:%s layout:%s serial:%d to rate:%d ch:%d fmt:%s layout:%s serial:%d\n",
-                           is->audio_filter_src.freq, is->audio_filter_src.ch_layout.nb_channels, av_get_sample_fmt_name(is->audio_filter_src.fmt), buf1, last_serial,
-                           frame->sample_rate, frame->ch_layout.nb_channels, av_get_sample_fmt_name(frame->format), buf2, is->auddec.pkt_serial);
+            // 如果需要重新配置滤镜
+            if (reconfigure) {
+                char buf1[1024], buf2[1024];
+                // 获取声道布局描述（用于日志）
+                av_channel_layout_describe(&is->audio_filter_src.ch_layout, buf1, sizeof(buf1));
+                av_channel_layout_describe(&frame->ch_layout, buf2, sizeof(buf2));
 
-                    is->audio_filter_src.fmt            = frame->format;
-                    ret = av_channel_layout_copy(&is->audio_filter_src.ch_layout, &frame->ch_layout);
-                    if (ret < 0)
-                        goto the_end;
-                    is->audio_filter_src.freq           = frame->sample_rate;
-                    last_serial                         = is->auddec.pkt_serial;
+                // 输出详细的格式变更日志
+                av_log(NULL, AV_LOG_DEBUG,
+                       "Audio frame changed from rate:%d ch:%d fmt:%s layout:%s serial:%d to rate:%d ch:%d fmt:%s layout:%s serial:%d\n",
+                       is->audio_filter_src.freq, is->audio_filter_src.ch_layout.nb_channels,
+                       av_get_sample_fmt_name(is->audio_filter_src.fmt), buf1, last_serial,
+                       frame->sample_rate, frame->ch_layout.nb_channels,
+                       av_get_sample_fmt_name(frame->format), buf2, is->auddec.pkt_serial);
 
-                    if ((ret = configure_audio_filters(is, afilters, 1)) < 0)
-                        goto the_end;
-                }
+                // 更新源格式信息
+                is->audio_filter_src.fmt = frame->format;
+                ret = av_channel_layout_copy(&is->audio_filter_src.ch_layout, &frame->ch_layout);
+                if (ret < 0)
+                    goto the_end;
+                is->audio_filter_src.freq = frame->sample_rate;
+                last_serial = is->auddec.pkt_serial;  // 更新序列号
 
+                // 重新配置音频滤镜链
+                if ((ret = configure_audio_filters(is, afilters, 1)) < 0)
+                    goto the_end;
+            }
+
+            // 将解码帧添加到滤镜图输入
             if ((ret = av_buffersrc_add_frame(is->in_audio_filter, frame)) < 0)
                 goto the_end;
 
+            /* 从滤镜图输出获取处理后的帧 */
             while ((ret = av_buffersink_get_frame_flags(is->out_audio_filter, frame, 0)) >= 0) {
+                // 获取帧的附加数据（如原始包位置）
                 FrameData *fd = frame->opaque_ref ? (FrameData*)frame->opaque_ref->data : NULL;
-                tb = av_buffersink_get_time_base(is->out_audio_filter);
+                tb = av_buffersink_get_time_base(is->out_audio_filter);  // 获取滤镜输出的时间基
+
+                // 从帧队列获取可写位置
                 if (!(af = frame_queue_peek_writable(&is->sampq)))
                     goto the_end;
 
+                // 设置帧信息
                 af->pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
-                af->pos = fd ? fd->pkt_pos : -1;
-                af->serial = is->auddec.pkt_serial;
-                af->duration = av_q2d((AVRational){frame->nb_samples, frame->sample_rate});
+                af->pos = fd ? fd->pkt_pos : -1;      // 原始包位置（用于seek）
+                af->serial = is->auddec.pkt_serial;   // 当前序列号
+                af->duration = av_q2d((AVRational){frame->nb_samples, frame->sample_rate}); // 帧持续时间
 
+                // 转移帧数据到队列（避免复制）
                 av_frame_move_ref(af->frame, frame);
+
+                // 将帧推入播放队列
                 frame_queue_push(&is->sampq);
 
+                // 检查序列号是否变化（seek操作）
                 if (is->audioq.serial != is->auddec.pkt_serial)
-                    break;
+                    break;  // 序列变化则停止处理当前帧
             }
+
+            // 处理滤镜图结束（EOF）
             if (ret == AVERROR_EOF)
                 is->auddec.finished = is->auddec.pkt_serial;
         }
+    // 循环条件：正常、需重试或结束状态
     } while (ret >= 0 || ret == AVERROR(EAGAIN) || ret == AVERROR_EOF);
- the_end:
-    avfilter_graph_free(&is->agraph);
-    av_frame_free(&frame);
-    return ret;
+
+ the_end:  // 清理资源
+    avfilter_graph_free(&is->agraph);  // 释放滤镜图
+    av_frame_free(&frame);             // 释放帧内存
+    return ret;                        // 返回状态
 }
 
 static int decoder_start(Decoder *d, int (*fn)(void *), const char *thread_name, void* arg)
