@@ -2750,59 +2750,73 @@ static int decoder_start(Decoder *d, int (*fn)(void *), const char *thread_name,
     return 0;
 }
 
+// 获取帧→检查参数→配置滤镜→处理帧→入队显示
+// 视频处理线程函数
 static int video_thread(void *arg)
 {
-    VideoState *is = arg;
-    AVFrame *frame = av_frame_alloc();
-    double pts;
-    double duration;
-    int ret;
-    AVRational tb = is->video_st->time_base;
-    AVRational frame_rate = av_guess_frame_rate(is->ic, is->video_st, NULL);
+    VideoState *is = arg; // 获取播放器状态
+    AVFrame *frame = av_frame_alloc(); // 分配帧内存
+    double pts; // 显示时间戳
+    double duration; // 帧持续时间
+    int ret; // 返回值
+    AVRational tb = is->video_st->time_base; // 视频流时间基
+    AVRational frame_rate = av_guess_frame_rate(is->ic, is->video_st, NULL); // 获取帧率
 
+    // 滤镜相关变量
     AVFilterGraph *graph = NULL;
     AVFilterContext *filt_out = NULL, *filt_in = NULL;
-    int last_w = 0;
-    int last_h = 0;
-    enum AVPixelFormat last_format = -2;
-    int last_serial = -1;
-    int last_vfilter_idx = 0;
+    int last_w = 0; // 缓存上次帧宽度
+    int last_h = 0; // 缓存上次帧高度
+    enum AVPixelFormat last_format = -2; // 缓存上次像素格式
+    int last_serial = -1; // 缓存上次包序列号
+    int last_vfilter_idx = 0; // 缓存上次滤镜索引
 
     if (!frame)
-        return AVERROR(ENOMEM);
+        return AVERROR(ENOMEM); // 内存分配失败处理
 
-    for (;;) {
+    for (;;) { // 主处理循环
+        // 获取视频帧
         ret = get_video_frame(is, frame);
         if (ret < 0)
-            goto the_end;
+            goto the_end; // 错误处理
         if (!ret)
-            continue;
+            continue; // 无数据则继续循环
 
+        /* 检测视频帧属性变化（分辨率/格式/序列号/滤镜）*/
         if (   last_w != frame->width
             || last_h != frame->height
             || last_format != frame->format
             || last_serial != is->viddec.pkt_serial
             || last_vfilter_idx != is->vfilter_idx) {
+
+            // 打印调试信息
             av_log(NULL, AV_LOG_DEBUG,
                    "Video frame changed from size:%dx%d format:%s serial:%d to size:%dx%d format:%s serial:%d\n",
                    last_w, last_h,
                    (const char *)av_x_if_null(av_get_pix_fmt_name(last_format), "none"), last_serial,
                    frame->width, frame->height,
                    (const char *)av_x_if_null(av_get_pix_fmt_name(frame->format), "none"), is->viddec.pkt_serial);
+
+            // 释放旧滤镜图并创建新图
             avfilter_graph_free(&graph);
             graph = avfilter_graph_alloc();
             if (!graph) {
                 ret = AVERROR(ENOMEM);
                 goto the_end;
             }
-            graph->nb_threads = filter_nbthreads;
+            graph->nb_threads = filter_nbthreads; // 设置滤镜线程数
+
+            // 配置新视频滤镜
             if ((ret = configure_video_filters(graph, is, vfilters_list ? vfilters_list[is->vfilter_idx] : NULL, frame)) < 0) {
+                // 配置失败时发送退出事件
                 SDL_Event event;
                 event.type = FF_QUIT_EVENT;
                 event.user.data1 = is;
                 SDL_PushEvent(&event);
                 goto the_end;
             }
+
+            // 更新滤镜上下文和缓存属性
             filt_in  = is->in_video_filter;
             filt_out = is->out_video_filter;
             last_w = frame->width;
@@ -2810,36 +2824,46 @@ static int video_thread(void *arg)
             last_format = frame->format;
             last_serial = is->viddec.pkt_serial;
             last_vfilter_idx = is->vfilter_idx;
-            frame_rate = av_buffersink_get_frame_rate(filt_out);
+            frame_rate = av_buffersink_get_frame_rate(filt_out); // 更新帧率
         }
 
+        // 将帧送入滤镜输入源
         ret = av_buffersrc_add_frame(filt_in, frame);
         if (ret < 0)
             goto the_end;
 
+        // 从滤镜输出接收处理后的帧
         while (ret >= 0) {
-            FrameData *fd;
+            FrameData *fd; // 帧元数据
 
-            is->frame_last_returned_time = av_gettime_relative() / 1000000.0;
+            is->frame_last_returned_time = av_gettime_relative() / 1000000.0; // 记录处理开始时间
 
+            // 获取滤镜处理后的帧
             ret = av_buffersink_get_frame_flags(filt_out, frame, 0);
             if (ret < 0) {
-                if (ret == AVERROR_EOF)
+                if (ret == AVERROR_EOF) // 流结束处理
                     is->viddec.finished = is->viddec.pkt_serial;
                 ret = 0;
                 break;
             }
 
-            fd = frame->opaque_ref ? (FrameData*)frame->opaque_ref->data : NULL;
+            fd = frame->opaque_ref ? (FrameData*)frame->opaque_ref->data : NULL; // 获取附加数据
 
+            // 计算滤镜处理延迟
             is->frame_last_filter_delay = av_gettime_relative() / 1000000.0 - is->frame_last_returned_time;
             if (fabs(is->frame_last_filter_delay) > AV_NOSYNC_THRESHOLD / 10.0)
-                is->frame_last_filter_delay = 0;
-            tb = av_buffersink_get_time_base(filt_out);
-            duration = (frame_rate.num && frame_rate.den ? av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0);
-            pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
+                is->frame_last_filter_delay = 0; // 超阈值则重置延迟
+
+            tb = av_buffersink_get_time_base(filt_out); // 更新输出时间基
+            duration = (frame_rate.num && frame_rate.den ?
+                       av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0); // 计算帧持续时间 一帧应该在屏幕上显示多长时间
+            pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb); // 计算显示时间戳
+
+            // 将处理后的帧加入显示队列
             ret = queue_picture(is, frame, pts, duration, fd ? fd->pkt_pos : -1, is->viddec.pkt_serial);
-            av_frame_unref(frame);
+            av_frame_unref(frame); // 释放帧引用
+
+            // 检查序列号是否变化（如发生seek）
             if (is->videoq.serial != is->viddec.pkt_serial)
                 break;
         }
@@ -2847,7 +2871,7 @@ static int video_thread(void *arg)
         if (ret < 0)
             goto the_end;
     }
- the_end:
+ the_end: // 清理资源
     avfilter_graph_free(&graph);
     av_frame_free(&frame);
     return 0;
@@ -2887,60 +2911,101 @@ static int subtitle_thread(void *arg)
     return 0;
 }
 
-/* copy samples for viewing in editor window */
+/* 
+ * 更新样本显示 - 将音频样本数据复制到显示缓冲区
+ * 目的：为音频波形可视化提供数据（通常在播放器界面显示）
+ * 
+ * 参数：
+ *   is - 播放器全局状态对象
+ *   samples - 音频样本数据数组（PCM数据）
+ *   samples_size - 样本数据总字节数
+ */
 static void update_sample_display(VideoState *is, short *samples, int samples_size)
 {
     int size, len;
-
+    
+    // 计算实际样本数量（每个样本占2字节）
     size = samples_size / sizeof(short);
+    
+    // 循环处理所有样本
     while (size > 0) {
+        // 计算环形缓冲区剩余空间
         len = SAMPLE_ARRAY_SIZE - is->sample_array_index;
+        
+        // 确保不超出待复制数据范围
         if (len > size)
             len = size;
+        
+        // 复制样本到显示缓冲区
         memcpy(is->sample_array + is->sample_array_index, samples, len * sizeof(short));
+        
+        // 更新源数据指针和目标索引
         samples += len;
         is->sample_array_index += len;
+        
+        // 环形缓冲区处理：到达末尾时回到起始位置
         if (is->sample_array_index >= SAMPLE_ARRAY_SIZE)
             is->sample_array_index = 0;
+        
+        // 更新剩余待处理样本数
         size -= len;
     }
 }
 
-/* return the wanted number of samples to get better sync if sync_type is video
- * or external master clock */
+/* 
+ * 音频同步处理 - 调整音频样本数以实现音视频同步
+ * 核心功能：当主同步时钟不是音频时钟时，通过增减样本数实现同步
+ * 
+ * 参数：
+ *   is - 播放器全局状态对象
+ *   nb_samples - 当前音频帧的原始样本数
+ * 
+ * 返回值：调整后的目标样本数
+ */
 static int synchronize_audio(VideoState *is, int nb_samples)
 {
-    int wanted_nb_samples = nb_samples;
+    int wanted_nb_samples = nb_samples;  // 默认返回原始样本数
 
-    /* if not master, then we try to remove or add samples to correct the clock */
+    // 仅当主同步时钟不是音频时钟时才需要调整
     if (get_master_sync_type(is) != AV_SYNC_AUDIO_MASTER) {
         double diff, avg_diff;
         int min_nb_samples, max_nb_samples;
 
+        // 计算音频时钟与主时钟的差值
         diff = get_clock(&is->audclk) - get_master_clock(is);
 
+        // 检查差值是否有效且在可接受范围内
         if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD) {
+            // 使用指数平滑累积时钟差值
             is->audio_diff_cum = diff + is->audio_diff_avg_coef * is->audio_diff_cum;
+            
+            // 确保有足够的测量值才进行估算
             if (is->audio_diff_avg_count < AUDIO_DIFF_AVG_NB) {
-                /* not enough measures to have a correct estimate */
                 is->audio_diff_avg_count++;
             } else {
-                /* estimate the A-V difference */
+                // 计算平均时钟偏差
                 avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
-
+                
+                // 如果平均偏差超过阈值，则调整样本数
                 if (fabs(avg_diff) >= is->audio_diff_threshold) {
+                    // 计算理论需要的样本数（基于采样率转换）
                     wanted_nb_samples = nb_samples + (int)(diff * is->audio_src.freq);
+                    
+                    // 计算允许的样本数调整范围（百分比限制）
                     min_nb_samples = ((nb_samples * (100 - SAMPLE_CORRECTION_PERCENT_MAX) / 100));
                     max_nb_samples = ((nb_samples * (100 + SAMPLE_CORRECTION_PERCENT_MAX) / 100));
+                    
+                    // 将调整后的样本数限制在合理范围内
                     wanted_nb_samples = av_clip(wanted_nb_samples, min_nb_samples, max_nb_samples);
                 }
+                
+                // 跟踪日志：记录同步调试信息
                 av_log(NULL, AV_LOG_TRACE, "diff=%f adiff=%f sample_diff=%d apts=%0.3f %f\n",
-                        diff, avg_diff, wanted_nb_samples - nb_samples,
-                        is->audio_clock, is->audio_diff_threshold);
+                      diff, avg_diff, wanted_nb_samples - nb_samples,
+                      is->audio_clock, is->audio_diff_threshold);
             }
         } else {
-            /* too big difference : may be initial PTS errors, so
-               reset A-V filter */
+            // 时钟偏差过大时重置同步状态
             is->audio_diff_avg_count = 0;
             is->audio_diff_cum       = 0;
         }
@@ -2950,109 +3015,181 @@ static int synchronize_audio(VideoState *is, int nb_samples)
 }
 
 /**
- * Decode one audio frame and return its uncompressed size.
- *
- * The processed audio frame is decoded, converted if required, and
- * stored in is->audio_buf, with size in bytes given by the return
- * value.
+ * 解码一帧音频数据并返回未压缩数据大小
+ * 
+ * 功能：
+ * 1. 从采样队列获取音频帧
+ * 2. 进行音视频同步计算
+ * 3. 处理音频重采样（格式/采样率转换）
+ * 4. 更新音频时钟
+ * 
+ * 返回：未压缩音频数据大小（字节数），出错返回-1
  */
 static int audio_decode_frame(VideoState *is)
 {
     int data_size, resampled_data_size;
-    av_unused double audio_clock0;
-    int wanted_nb_samples;
-    Frame *af;
+    av_unused double audio_clock0;  // 调试用时钟值
+    int wanted_nb_samples;          // 同步调整后的样本数
+    Frame *af;                      // 音频帧指针
 
+    // 检查播放状态（暂停直接返回）
     if (is->paused)
         return -1;
 
+    // 从采样队列获取有效音频帧
     do {
+        // Windows平台特殊处理：避免长时间阻塞
 #if defined(_WIN32)
         while (frame_queue_nb_remaining(&is->sampq) == 0) {
-            if ((av_gettime_relative() - audio_callback_time) > 1000000LL * is->audio_hw_buf_size / is->audio_tgt.bytes_per_sec / 2)
+            // 计算超时时间（半缓冲区时长）
+            if ((av_gettime_relative() - audio_callback_time) > 
+                1000000LL * is->audio_hw_buf_size / is->audio_tgt.bytes_per_sec / 2)
                 return -1;
-            av_usleep (1000);
+            av_usleep(1000);  // 短暂休眠避免CPU忙等
         }
 #endif
+        // 获取可读帧（非阻塞）
         if (!(af = frame_queue_peek_readable(&is->sampq)))
             return -1;
-        frame_queue_next(&is->sampq);
-    } while (af->serial != is->audioq.serial);
+        frame_queue_next(&is->sampq);  // 移动队列指针
+    } while (af->serial != is->audioq.serial);  // 确保序列号匹配（处理seek操作）
 
-    data_size = av_samples_get_buffer_size(NULL, af->frame->ch_layout.nb_channels,
-                                           af->frame->nb_samples,
-                                           af->frame->format, 1);
+    // 计算原始音频帧数据大小
+    data_size = av_samples_get_buffer_size(
+        NULL, 
+        af->frame->ch_layout.nb_channels,  // 声道数
+        af->frame->nb_samples,             // 样本数
+        af->frame->format,                 // 采样格式
+        1                                  // 对齐
+    );
 
+    // 音视频同步：计算调整后的样本数
     wanted_nb_samples = synchronize_audio(is, af->frame->nb_samples);
 
-    if (af->frame->format        != is->audio_src.fmt            ||
-        av_channel_layout_compare(&af->frame->ch_layout, &is->audio_src.ch_layout) ||
-        af->frame->sample_rate   != is->audio_src.freq           ||
-        (wanted_nb_samples       != af->frame->nb_samples && !is->swr_ctx)) {
+    // 检查是否需要初始化/重建重采样器
+    if (af->frame->format != is->audio_src.fmt ||             // 采样格式变化
+        av_channel_layout_compare(&af->frame->ch_layout, &is->audio_src.ch_layout) || // 声道布局变化
+        af->frame->sample_rate != is->audio_src.freq ||       // 采样率变化
+        (wanted_nb_samples != af->frame->nb_samples && !is->swr_ctx) // 样本数调整且无重采样器
+    ) {
         int ret;
-        swr_free(&is->swr_ctx);
-        ret = swr_alloc_set_opts2(&is->swr_ctx,
-                            &is->audio_tgt.ch_layout, is->audio_tgt.fmt, is->audio_tgt.freq,
-                            &af->frame->ch_layout, af->frame->format, af->frame->sample_rate,
-                            0, NULL);
+        swr_free(&is->swr_ctx);  // 释放现有重采样器
+        
+        // 创建新的重采样器配置
+        ret = swr_alloc_set_opts2(
+            &is->swr_ctx,
+            &is->audio_tgt.ch_layout,   // 目标声道布局
+            is->audio_tgt.fmt,          // 目标采样格式
+            is->audio_tgt.freq,         // 目标采样率
+            &af->frame->ch_layout,      // 源声道布局
+            af->frame->format,          // 源采样格式
+            af->frame->sample_rate,     // 源采样率
+            0,                          // 日志偏移
+            NULL                        // 日志上下文
+        );
+        
+        // 初始化重采样器
         if (ret < 0 || swr_init(is->swr_ctx) < 0) {
             av_log(NULL, AV_LOG_ERROR,
-                   "Cannot create sample rate converter for conversion of %d Hz %s %d channels to %d Hz %s %d channels!\n",
-                    af->frame->sample_rate, av_get_sample_fmt_name(af->frame->format), af->frame->ch_layout.nb_channels,
-                    is->audio_tgt.freq, av_get_sample_fmt_name(is->audio_tgt.fmt), is->audio_tgt.ch_layout.nb_channels);
+                   "无法创建采样率转换器：从 %d Hz %s %d 声道 到 %d Hz %s %d 声道\n",
+                   af->frame->sample_rate, 
+                   av_get_sample_fmt_name(af->frame->format),
+                   af->frame->ch_layout.nb_channels,
+                   is->audio_tgt.freq,
+                   av_get_sample_fmt_name(is->audio_tgt.fmt),
+                   is->audio_tgt.ch_layout.nb_channels);
             swr_free(&is->swr_ctx);
             return -1;
         }
+        
+        // 更新音频源参数
         if (av_channel_layout_copy(&is->audio_src.ch_layout, &af->frame->ch_layout) < 0)
             return -1;
         is->audio_src.freq = af->frame->sample_rate;
         is->audio_src.fmt = af->frame->format;
     }
 
+    // 音频重采样处理
     if (is->swr_ctx) {
         const uint8_t **in = (const uint8_t **)af->frame->extended_data;
         uint8_t **out = &is->audio_buf1;
+        
+        // 计算重采样输出缓冲区大小（包含安全余量）
         int out_count = (int64_t)wanted_nb_samples * is->audio_tgt.freq / af->frame->sample_rate + 256;
-        int out_size  = av_samples_get_buffer_size(NULL, is->audio_tgt.ch_layout.nb_channels, out_count, is->audio_tgt.fmt, 0);
+        int out_size = av_samples_get_buffer_size(
+            NULL, 
+            is->audio_tgt.ch_layout.nb_channels,
+            out_count,
+            is->audio_tgt.fmt,
+            0
+        );
+        
         int len2;
         if (out_size < 0) {
-            av_log(NULL, AV_LOG_ERROR, "av_samples_get_buffer_size() failed\n");
+            av_log(NULL, AV_LOG_ERROR, "av_samples_get_buffer_size() 失败\n");
             return -1;
         }
+        
+        // 设置样本数补偿（用于同步调整）
         if (wanted_nb_samples != af->frame->nb_samples) {
-            if (swr_set_compensation(is->swr_ctx, (wanted_nb_samples - af->frame->nb_samples) * is->audio_tgt.freq / af->frame->sample_rate,
-                                        wanted_nb_samples * is->audio_tgt.freq / af->frame->sample_rate) < 0) {
-                av_log(NULL, AV_LOG_ERROR, "swr_set_compensation() failed\n");
+            if (swr_set_compensation(
+                is->swr_ctx, 
+                (wanted_nb_samples - af->frame->nb_samples) * is->audio_tgt.freq / af->frame->sample_rate,
+                wanted_nb_samples * is->audio_tgt.freq / af->frame->sample_rate) < 0
+            ) {
+                av_log(NULL, AV_LOG_ERROR, "swr_set_compensation() 失败\n");
                 return -1;
             }
         }
+        
+        // 动态分配重采样缓冲区
         av_fast_malloc(&is->audio_buf1, &is->audio_buf1_size, out_size);
         if (!is->audio_buf1)
             return AVERROR(ENOMEM);
-        len2 = swr_convert(is->swr_ctx, out, out_count, in, af->frame->nb_samples);
+        
+        // 执行重采样
+        len2 = swr_convert(
+            is->swr_ctx, 
+            out,       // 输出缓冲区
+            out_count, // 输出容量
+            in,        // 输入数据
+            af->frame->nb_samples // 输入样本数
+        );
+        
         if (len2 < 0) {
-            av_log(NULL, AV_LOG_ERROR, "swr_convert() failed\n");
+            av_log(NULL, AV_LOG_ERROR, "swr_convert() 失败\n");
             return -1;
         }
+        
+        // 缓冲区不足警告处理
         if (len2 == out_count) {
-            av_log(NULL, AV_LOG_WARNING, "audio buffer is probably too small\n");
+            av_log(NULL, AV_LOG_WARNING, "音频缓冲区可能太小\n");
             if (swr_init(is->swr_ctx) < 0)
                 swr_free(&is->swr_ctx);
         }
+        
+        // 设置最终音频缓冲区
         is->audio_buf = is->audio_buf1;
-        resampled_data_size = len2 * is->audio_tgt.ch_layout.nb_channels * av_get_bytes_per_sample(is->audio_tgt.fmt);
+        // 计算重采样后数据大小
+        resampled_data_size = len2 * is->audio_tgt.ch_layout.nb_channels * 
+                              av_get_bytes_per_sample(is->audio_tgt.fmt);
     } else {
+        // 无需重采样：直接使用原始数据
         is->audio_buf = af->frame->data[0];
         resampled_data_size = data_size;
     }
 
+    // 更新音频时钟（用于同步）
     audio_clock0 = is->audio_clock;
-    /* update the audio clock with the pts */
-    if (!isnan(af->pts))
-        is->audio_clock = af->pts + (double) af->frame->nb_samples / af->frame->sample_rate;
-    else
-        is->audio_clock = NAN;
-    is->audio_clock_serial = af->serial;
+    if (!isnan(af->pts)) {
+        // 基于时间戳计算新时钟：PTS + 本帧持续时间
+        is->audio_clock = af->pts + (double)af->frame->nb_samples / af->frame->sample_rate;
+    } else {
+        is->audio_clock = NAN;  // 无效时间戳
+    }
+    is->audio_clock_serial = af->serial;  // 更新序列号
+
+// 调试信息
 #ifdef DEBUG
     {
         static double last_clock;
@@ -3062,6 +3199,7 @@ static int audio_decode_frame(VideoState *is)
         last_clock = is->audio_clock;
     }
 #endif
+
     return resampled_data_size;
 }
 
